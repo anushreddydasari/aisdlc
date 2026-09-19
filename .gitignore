@@ -1,0 +1,25 @@
+# Secrets — never commit.
+# .env holds the live Atlas connection string (which embeds a password), the
+# Neutara API token, the webhook secret and the operator token. The negation
+# below keeps .env.example tracked, since it carries variable NAMES only.
+.env
+.env.*
+!.env.example
+
+# Dependencies and build output
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Database dumps — these contain real approval history and ticket text.
+# They belong in object storage, never in a repository. (The Neutara repo
+# carries a 64 MB tracked SQL dump; that is the mistake this rule prevents.)
+dumps/
+*.bson
+*.archive
+*.gz
+
+# Logs and OS noise
+*.log
+.DS_Store
+Thumbs.db
