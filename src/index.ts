@@ -6,10 +6,13 @@
  * an obscure error later on.
  */
 
-import { loadConfig, loadWebhookConfig, ConfigError } from './config/env.ts';
+import { loadConfig, loadNeutaraConfig, loadWebhookConfig, ConfigError } from './config/env.ts';
 import { createConnectionManager } from './db/client.ts';
 import { createAuditLog } from './db/audit-log.ts';
 import { createWebhookDeliveryRepository } from './db/webhook-deliveries.ts';
+import { createIntakeRepository } from './intake/repository.ts';
+import { createNeutaraClient } from './neutara/client.ts';
+import { startEnrichmentLoop, type EnrichmentLoop } from './enrichment/scheduler.ts';
 import { createLogger } from './logging/logger.ts';
 import { createHttpServer } from './api/server.ts';
 
@@ -76,12 +79,45 @@ async function main(): Promise<void> {
     },
   });
 
+  // Phase 4: drain pending deliveries into intake items. Started only when
+  // Neutara is configured — without it there is nothing to enrich with, and
+  // a loop that can only fail is worse than no loop.
+  let enrichment: EnrichmentLoop | undefined;
+  const neutara = loadNeutaraConfig(process.env);
+  if (!neutara.configured) {
+    logger.warn('enrichment disabled', { detail: neutara.reason });
+  } else {
+    const client = createNeutaraClient({
+      baseUrl: neutara.config.baseUrl,
+      token: neutara.config.token,
+      logger,
+    });
+    enrichment = startEnrichmentLoop(
+      {
+        get deliveries() {
+          return createWebhookDeliveryRepository(mongo.db()!, logger);
+        },
+        get intake() {
+          const db = mongo.db()!;
+          return createIntakeRepository(db, createAuditLog(db, logger), logger);
+        },
+        client,
+        logger,
+      },
+      // Skipped while disconnected: a pass then could only produce errors.
+      { isReady: () => mongo.db() !== undefined },
+    );
+  }
+
   server.listen(config.port, () => {
     logger.info('http server listening', { port: config.port });
   });
 
   const shutdown = (signal: string): void => {
     logger.info('shutting down', { signal });
+    // Stopped before the connection closes, so an in-flight pass is not left
+    // reaching for a client that is going away.
+    enrichment?.stop();
     server.close(() => {
       void (async () => {
         await mongo.close();

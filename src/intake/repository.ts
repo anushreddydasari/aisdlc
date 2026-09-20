@@ -25,6 +25,15 @@ import {
 import { contentHash } from './hash.ts';
 import { INITIAL_INTAKE_STATUS, assertTransition } from './state.ts';
 
+/**
+ * The content of an issue that affects what work is appropriate.
+ *
+ * Every field here feeds `sourceHash`, and therefore decides when a completed
+ * checkpoint stops being safe to reuse. Adding a field means a change to it
+ * invalidates resumed work — so high-churn fields (status, assignee) and
+ * unbounded ones (comments, attachments) belong in `IntakeSnapshotMeta`
+ * instead, which is stored but not hashed.
+ */
 export interface IntakeSnapshot {
   readonly title: string;
   readonly description: string;
@@ -32,6 +41,27 @@ export interface IntakeSnapshot {
   readonly priority?: string | null;
   readonly reporter?: string | null;
   readonly project?: string | null;
+  /** Hashed order-independently; see hashSnapshot. */
+  readonly labels?: readonly string[] | null;
+  readonly parentKey?: string | null;
+}
+
+/**
+ * Context worth keeping but deliberately NOT hashed.
+ *
+ * `status` and `assignee` change constantly; hashing them would invalidate
+ * every checkpoint for an issue each time someone reassigns it.
+ * `descriptionTruncated` records that Neutara capped an oversized
+ * description, which explains an otherwise puzzling hash change.
+ */
+export interface IntakeSnapshotMeta {
+  readonly createdAt?: string | null;
+  readonly cfKey?: string | null;
+  readonly status?: string | null;
+  readonly assignee?: string | null;
+  readonly spaceName?: string | null;
+  readonly descriptionTruncated?: boolean;
+  readonly fetchedAt?: Date;
 }
 
 export interface IntakeItemDocument {
@@ -40,6 +70,7 @@ export interface IntakeItemDocument {
   source: IntakeSource;
   deliveryRef: ObjectId | null;
   snapshot: IntakeSnapshot;
+  snapshotMeta: IntakeSnapshotMeta | null;
   sourceHash: string;
   status: IntakeStatus;
   statusReason: string | null;
@@ -54,6 +85,7 @@ export interface CreateIntakeInput {
   readonly issueKey: string;
   readonly source: IntakeSource;
   readonly snapshot: IntakeSnapshot;
+  readonly snapshotMeta?: IntakeSnapshotMeta | null;
   readonly deliveryRef?: ObjectId | null;
   readonly receivedAt?: Date;
 }
@@ -144,7 +176,17 @@ function isDuplicateKey(error: unknown): boolean {
   return typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 11000;
 }
 
-/** Only the fields that describe the issue feed the hash — not our bookkeeping. */
+/**
+ * Only the fields that describe the issue feed the hash — not our bookkeeping.
+ *
+ * Labels are sorted before hashing. `canonicalize` preserves array order on
+ * purpose, because order is content for most lists; for a label set it is
+ * not, and an unsorted hash would invalidate checkpoints whenever someone
+ * reordered labels without changing them.
+ *
+ * Fields deliberately excluded: status, assignee, comments, attachments,
+ * activity, productType, customerPlan. All are either high-churn or unbounded.
+ */
 export function hashSnapshot(snapshot: IntakeSnapshot): string {
   return contentHash({
     title: snapshot.title,
@@ -153,6 +195,8 @@ export function hashSnapshot(snapshot: IntakeSnapshot): string {
     priority: snapshot.priority ?? null,
     reporter: snapshot.reporter ?? null,
     project: snapshot.project ?? null,
+    labels: snapshot.labels === undefined || snapshot.labels === null ? [] : [...snapshot.labels].sort(),
+    parentKey: snapshot.parentKey ?? null,
   });
 }
 
@@ -187,6 +231,7 @@ export function createIntakeRepository(
         source: input.source,
         deliveryRef: input.deliveryRef ?? null,
         snapshot: input.snapshot,
+        snapshotMeta: input.snapshotMeta ?? null,
         sourceHash: hashSnapshot(input.snapshot),
         status: INITIAL_INTAKE_STATUS,
         statusReason: null,

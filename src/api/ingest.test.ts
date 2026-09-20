@@ -75,6 +75,13 @@ function harness(
     async findByDeliveryId() {
       return null;
     },
+    // Phase 4 surface; unused by the ingest handler, which only records.
+    async findPending() {
+      return [];
+    },
+    async markEnriched() {},
+    async scheduleRetry() {},
+    async markFailed() {},
   };
 
   const audit: AuditLog = {

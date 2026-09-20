@@ -196,6 +196,7 @@ describe('create', () => {
       source: 'webhook',
       deliveryRef: null,
       snapshot: SNAPSHOT,
+      snapshotMeta: null,
       sourceHash: hashSnapshot(SNAPSHOT),
       status: 'received',
       statusReason: null,

@@ -286,8 +286,17 @@ export const INTAKE_ITEM_SCHEMA: Document = {
           priority: { bsonType: ['string', 'null'] },
           reporter: { bsonType: ['string', 'null'] },
           project: { bsonType: ['string', 'null'] },
+          // Hashed order-independently; see hashSnapshot in the repository.
+          labels: { bsonType: ['array', 'null'], items: { bsonType: 'string' } },
+          parentKey: { bsonType: ['string', 'null'] },
         },
       },
+      /**
+       * Stored context that is deliberately NOT hashed: status and assignee
+       * change constantly, and hashing them would invalidate every checkpoint
+       * for an issue whenever someone reassigned it.
+       */
+      snapshotMeta: { bsonType: ['object', 'null'] },
       // What makes checkpoints.inputHash meaningful: resume can only reuse a
       // completed step if it can prove the intake content has not changed.
       sourceHash: { bsonType: 'string', minLength: 1 },

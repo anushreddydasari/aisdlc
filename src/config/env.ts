@@ -198,6 +198,80 @@ export function loadWebhookConfig(source: EnvSource): WebhookConfig {
   return { webhookSecret: secret };
 }
 
+export const NEUTARA_BASE_URL_VARIABLE = 'NEUTARA_API_BASE_URL';
+export const NEUTARA_TOKEN_VARIABLE = 'NEUTARA_API_TOKEN';
+
+export interface NeutaraConfig {
+  /** Origin only, no trailing slash. The client appends `/api/issues/{key}`. */
+  readonly baseUrl: string;
+  readonly token: string;
+}
+
+export type NeutaraConfigResult =
+  | { readonly configured: true; readonly config: NeutaraConfig }
+  | { readonly configured: false; readonly reason: string };
+
+/**
+ * Normalises and checks the Neutara base URL.
+ *
+ * It must be an ORIGIN. The client appends `/api/issues/{key}`, so a value
+ * that already carries `/api` produces `/api/api/issues/...` and a confusing
+ * 404 rather than an obvious configuration error. A trailing slash would
+ * produce a double slash for the same reason. Both are caught here instead.
+ */
+export function normalizeNeutaraBaseUrl(
+  value: string,
+): { ok: true; baseUrl: string } | { ok: false; reason: string } {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return { ok: false, reason: `${NEUTARA_BASE_URL_VARIABLE} is not a valid URL` };
+  }
+
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    return { ok: false, reason: `${NEUTARA_BASE_URL_VARIABLE} must be http or https` };
+  }
+  if (url.search !== '' || url.hash !== '') {
+    return { ok: false, reason: `${NEUTARA_BASE_URL_VARIABLE} must not carry a query or fragment` };
+  }
+
+  const path = url.pathname.replace(/\/+$/, '');
+  if (path !== '') {
+    return {
+      ok: false,
+      reason:
+        `${NEUTARA_BASE_URL_VARIABLE} must be an origin with no path; ` +
+        `the client appends '/api/issues/{key}' itself`,
+    };
+  }
+
+  return { ok: true, baseUrl: url.origin };
+}
+
+/**
+ * The Phase 4 group. Like the webhook secret, absent is a valid state: the
+ * service runs without enrichment rather than refusing to start.
+ */
+export function loadNeutaraConfig(source: EnvSource): NeutaraConfigResult {
+  const rawBaseUrl = present(source, NEUTARA_BASE_URL_VARIABLE);
+  const token = present(source, NEUTARA_TOKEN_VARIABLE);
+
+  const missing = [
+    rawBaseUrl === undefined ? NEUTARA_BASE_URL_VARIABLE : null,
+    token === undefined ? NEUTARA_TOKEN_VARIABLE : null,
+  ].filter((name): name is string => name !== null);
+
+  if (missing.length > 0) {
+    return { configured: false, reason: `${missing.join(', ')} not set; enrichment is disabled` };
+  }
+
+  const normalized = normalizeNeutaraBaseUrl(rawBaseUrl!);
+  if (!normalized.ok) return { configured: false, reason: normalized.reason };
+
+  return { configured: true, config: { baseUrl: normalized.baseUrl, token: token! } };
+}
+
 /** Validates the deploy-only migration group. Never called by the service. */
 export function loadMigrationConfig(source: EnvSource): MigrationConfig {
   const failures = new Failures();

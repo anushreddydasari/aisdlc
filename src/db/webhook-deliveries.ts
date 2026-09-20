@@ -62,6 +62,14 @@ export type RecordDeliveryResult =
 export interface WebhookDeliveryRepository {
   record(input: RecordDeliveryInput): Promise<RecordDeliveryResult>;
   findByDeliveryId(deliveryId: string): Promise<WebhookDeliveryDocument | null>;
+  /** Deliveries due for enrichment, oldest first. Uses status_nextAttemptAt. */
+  findPending(now: Date, limit: number): Promise<WebhookDeliveryDocument[]>;
+  /** Terminal success. Links the intake item that was created. */
+  markEnriched(deliveryId: string, intakeItemId: ObjectId, now?: Date): Promise<void>;
+  /** Transient failure: stays pending, with attempts and backoff advanced. */
+  scheduleRetry(deliveryId: string, message: string, nextAttemptAt: Date, now?: Date): Promise<void>;
+  /** Terminal failure: permanent error, or attempts exhausted. */
+  markFailed(deliveryId: string, message: string, now?: Date): Promise<void>;
 }
 
 function isDuplicateKey(error: unknown): boolean {
@@ -126,6 +134,51 @@ export function createWebhookDeliveryRepository(
 
     async findByDeliveryId(deliveryId: string): Promise<WebhookDeliveryDocument | null> {
       return collection.findOne({ deliveryId });
+    },
+
+    async findPending(now: Date, limit: number): Promise<WebhookDeliveryDocument[]> {
+      return collection
+        .find({ status: 'pending', nextAttemptAt: { $lte: now } })
+        .sort({ nextAttemptAt: 1 })
+        .limit(limit)
+        .toArray();
+    },
+
+    async markEnriched(deliveryId: string, intakeItemId: ObjectId, now = new Date()): Promise<void> {
+      // Guarded on `pending` so a delivery already settled by a concurrent
+      // worker is not dragged back; the update simply matches nothing.
+      await collection.updateOne(
+        { deliveryId, status: 'pending' },
+        { $set: { status: 'enriched', intakeItemId, lastError: null, updatedAt: now } },
+      );
+      logger.info('delivery enriched', { deliveryId });
+    },
+
+    async scheduleRetry(
+      deliveryId: string,
+      message: string,
+      nextAttemptAt: Date,
+      now = new Date(),
+    ): Promise<void> {
+      await collection.updateOne(
+        { deliveryId, status: 'pending' },
+        {
+          $inc: { attempts: 1 },
+          $set: { nextAttemptAt, lastError: { message, at: now }, updatedAt: now },
+        },
+      );
+      logger.warn('delivery enrichment failed; retry scheduled', { deliveryId, nextAttemptAt });
+    },
+
+    async markFailed(deliveryId: string, message: string, now = new Date()): Promise<void> {
+      await collection.updateOne(
+        { deliveryId, status: 'pending' },
+        {
+          $inc: { attempts: 1 },
+          $set: { status: 'failed', lastError: { message, at: now }, updatedAt: now },
+        },
+      );
+      logger.error('delivery enrichment failed permanently', { deliveryId });
     },
   };
 }

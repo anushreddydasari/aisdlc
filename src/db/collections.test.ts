@@ -288,6 +288,25 @@ describe('intakeItems validator', () => {
     assert.equal(schemaOf(INTAKE_ITEM_SCHEMA).properties['issueKey']!['bsonType'], 'string');
   });
 
+  it('accepts the Phase 4 hashed fields', () => {
+    const snapshot = schemaOf(INTAKE_ITEM_SCHEMA).properties['snapshot'] as {
+      properties: Record<string, Record<string, unknown>>;
+    };
+    assert.deepEqual(snapshot.properties['labels']!['bsonType'], ['array', 'null']);
+    assert.deepEqual(snapshot.properties['parentKey']!['bsonType'], ['string', 'null']);
+  });
+
+  it('keeps unhashed context out of the snapshot, in snapshotMeta', () => {
+    // status and assignee change constantly; hashing them would invalidate
+    // every checkpoint for an issue on each reassignment.
+    const props = schemaOf(INTAKE_ITEM_SCHEMA).properties;
+    const snapshot = props['snapshot'] as { properties: Record<string, unknown> };
+    for (const field of ['status', 'assignee', 'cfKey', 'createdAt']) {
+      assert.ok(!(field in snapshot.properties), `${field} is inside the hashed snapshot`);
+    }
+    assert.deepEqual(props['snapshotMeta']!['bsonType'], ['object', 'null']);
+  });
+
   it('allows approval fields to be absent until an item is approved', () => {
     const { required, properties } = schemaOf(INTAKE_ITEM_SCHEMA);
     assert.ok(!required.includes('approvedBy'));

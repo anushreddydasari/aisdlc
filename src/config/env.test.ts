@@ -6,7 +6,9 @@ import {
   isMongoUri,
   loadConfig,
   loadMigrationConfig,
+  loadNeutaraConfig,
   loadWebhookConfig,
+  normalizeNeutaraBaseUrl,
 } from './env.ts';
 
 /** A syntactically valid URI with an obvious fake password, for leak assertions. */
@@ -238,5 +240,186 @@ describe('loadWebhookConfig', () => {
   it('ignores the production database URIs entirely', () => {
     const result = loadWebhookConfig({ ...VALID_ENV, NEUTARA_WEBHOOK_SECRET: 'whsec_x' });
     assert.deepEqual(Object.keys(result), ['webhookSecret']);
+  });
+});
+
+/** An obviously fake token, used to assert it never reaches a message. */
+const FAKE_TOKEN = 'nta_not_a_real_token_value'; // pragma: fixture
+const NEUTARA_ENV = {
+  NEUTARA_API_BASE_URL: 'https://neutara.example.com',
+  NEUTARA_API_TOKEN: FAKE_TOKEN,
+} as const;
+
+describe('normalizeNeutaraBaseUrl', () => {
+  it('accepts a plain HTTPS origin unchanged', () => {
+    const result = normalizeNeutaraBaseUrl('https://neutara.example.com');
+    assert.ok(result.ok);
+    assert.equal(result.baseUrl, 'https://neutara.example.com');
+  });
+
+  it('accepts http, for a local instance', () => {
+    const result = normalizeNeutaraBaseUrl('http://localhost:8080');
+    assert.ok(result.ok);
+    assert.equal(result.baseUrl, 'http://localhost:8080');
+  });
+
+  it('strips a trailing slash', () => {
+    // Otherwise the client builds `https://host//api/issues/KEY`.
+    for (const value of ['https://neutara.example.com/', 'https://neutara.example.com//']) {
+      const result = normalizeNeutaraBaseUrl(value);
+      assert.ok(result.ok, `rejected ${value}`);
+      assert.equal(result.baseUrl, 'https://neutara.example.com');
+    }
+  });
+
+  it('rejects a base URL that already carries /api', () => {
+    // The client appends `/api/issues/{key}` itself, so this would produce
+    // `/api/api/issues/...` and a 404 that looks like a missing ticket
+    // rather than a configuration error.
+    for (const value of [
+      'https://neutara.example.com/api',
+      'https://neutara.example.com/api/',
+      'https://neutara.example.com/api/issues',
+    ]) {
+      const result = normalizeNeutaraBaseUrl(value);
+      assert.ok(!result.ok, `accepted ${value}`);
+      assert.match(result.reason, /origin with no path/);
+    }
+  });
+
+  it('rejects any other path component', () => {
+    for (const value of ['https://neutara.example.com/v1', 'https://neutara.example.com/a/b']) {
+      assert.ok(!normalizeNeutaraBaseUrl(value).ok, `accepted ${value}`);
+    }
+  });
+
+  it('rejects a query string', () => {
+    const result = normalizeNeutaraBaseUrl('https://neutara.example.com?token=x');
+    assert.ok(!result.ok);
+    assert.match(result.reason, /query or fragment/);
+  });
+
+  it('rejects a fragment', () => {
+    const result = normalizeNeutaraBaseUrl('https://neutara.example.com#section');
+    assert.ok(!result.ok);
+    assert.match(result.reason, /query or fragment/);
+  });
+
+  it('rejects an unsupported scheme', () => {
+    for (const value of [
+      'ftp://neutara.example.com',
+      'ws://neutara.example.com',
+      'file:///etc/passwd',
+      'javascript:alert(1)',
+    ]) {
+      const result = normalizeNeutaraBaseUrl(value);
+      assert.ok(!result.ok, `accepted ${value}`);
+      assert.match(result.reason, /http or https/);
+    }
+  });
+
+  it('rejects a value that is not a URL at all', () => {
+    for (const value of ['neutara.example.com', 'not a url', '', '   ']) {
+      const result = normalizeNeutaraBaseUrl(value);
+      assert.ok(!result.ok, `accepted ${JSON.stringify(value)}`);
+      assert.match(result.reason, /not a valid URL/);
+    }
+  });
+
+  it('names the variable in every rejection, so the fix is obvious', () => {
+    for (const value of ['nope', 'ftp://x.example.com', 'https://x.example.com/api', 'https://x.example.com?a=1']) {
+      const result = normalizeNeutaraBaseUrl(value);
+      assert.ok(!result.ok);
+      assert.match(result.reason, /NEUTARA_API_BASE_URL/);
+    }
+  });
+});
+
+describe('loadNeutaraConfig', () => {
+  it('resolves when both variables are configured', () => {
+    const result = loadNeutaraConfig(NEUTARA_ENV);
+    assert.ok(result.configured);
+    assert.equal(result.config.baseUrl, 'https://neutara.example.com');
+    assert.equal(result.config.token, FAKE_TOKEN);
+  });
+
+  it('normalises the base URL on the way through', () => {
+    const result = loadNeutaraConfig({ ...NEUTARA_ENV, NEUTARA_API_BASE_URL: 'https://neutara.example.com/' });
+    assert.ok(result.configured);
+    assert.equal(result.config.baseUrl, 'https://neutara.example.com');
+  });
+
+  it('reports a missing base URL rather than throwing', () => {
+    // Absent is a valid state: the service runs without enrichment instead
+    // of refusing to start.
+    const result = loadNeutaraConfig({ NEUTARA_API_TOKEN: FAKE_TOKEN });
+    assert.ok(!result.configured);
+    assert.match(result.reason, /NEUTARA_API_BASE_URL/);
+    assert.match(result.reason, /enrichment is disabled/);
+  });
+
+  it('reports a missing token rather than throwing', () => {
+    const result = loadNeutaraConfig({ NEUTARA_API_BASE_URL: 'https://neutara.example.com' });
+    assert.ok(!result.configured);
+    assert.match(result.reason, /NEUTARA_API_TOKEN/);
+  });
+
+  it('names both variables when neither is set', () => {
+    const result = loadNeutaraConfig({});
+    assert.ok(!result.configured);
+    assert.match(result.reason, /NEUTARA_API_BASE_URL/);
+    assert.match(result.reason, /NEUTARA_API_TOKEN/);
+  });
+
+  it('treats a blank value as missing', () => {
+    for (const override of [{ NEUTARA_API_BASE_URL: '   ' }, { NEUTARA_API_TOKEN: '  ' }]) {
+      assert.ok(!loadNeutaraConfig({ ...NEUTARA_ENV, ...override }).configured);
+    }
+  });
+
+  it('trims surrounding whitespace on the token', () => {
+    const result = loadNeutaraConfig({ ...NEUTARA_ENV, NEUTARA_API_TOKEN: `  ${FAKE_TOKEN}  ` });
+    assert.ok(result.configured);
+    assert.equal(result.config.token, FAKE_TOKEN);
+  });
+
+  it('propagates a base-URL rejection', () => {
+    const result = loadNeutaraConfig({ ...NEUTARA_ENV, NEUTARA_API_BASE_URL: 'https://x.example.com/api' });
+    assert.ok(!result.configured);
+    assert.match(result.reason, /origin with no path/);
+  });
+
+  it('never includes the token in a failure reason', () => {
+    // Reasons are logged at startup; a token in one would be a leak.
+    for (const override of [
+      { NEUTARA_API_BASE_URL: 'not-a-url' },
+      { NEUTARA_API_BASE_URL: 'ftp://x.example.com' },
+      { NEUTARA_API_BASE_URL: 'https://x.example.com/api' },
+      { NEUTARA_API_BASE_URL: '' },
+    ]) {
+      const result = loadNeutaraConfig({ ...NEUTARA_ENV, ...override });
+      assert.ok(!result.configured);
+      assert.ok(!result.reason.includes(FAKE_TOKEN), 'the token reached the failure reason');
+      assert.ok(!result.reason.includes('nta_'), 'a token prefix reached the failure reason');
+    }
+  });
+
+  it('never echoes the base URL value back either', () => {
+    // The host is not a secret, but quoting input into an error is the habit
+    // that leaks the ones that are.
+    const result = loadNeutaraConfig({ ...NEUTARA_ENV, NEUTARA_API_BASE_URL: 'https://secret-host.example.com/api' });
+    assert.ok(!result.configured);
+    assert.ok(!result.reason.includes('secret-host'));
+  });
+
+  it('ignores variables belonging to other phases', () => {
+    const result = loadNeutaraConfig({
+      ...NEUTARA_ENV,
+      ...VALID_ENV,
+      NEUTARA_WEBHOOK_SECRET: 'whsec_x',
+      OPERATOR_TOKEN: 'op_x',
+    });
+    assert.ok(result.configured);
+    assert.deepEqual(Object.keys(result.config).sort(), ['baseUrl', 'token']);
   });
 });
