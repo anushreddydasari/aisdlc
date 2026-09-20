@@ -3,7 +3,12 @@ import { after, describe, it } from 'node:test';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 
-import { createHttpServer, type ServerDeps } from './server.ts';
+import {
+  HEADERS_TIMEOUT_MS,
+  REQUEST_TIMEOUT_MS,
+  createHttpServer,
+  type ServerDeps,
+} from './server.ts';
 import type { HealthDeps } from './health.ts';
 import { createLogger } from '../logging/logger.ts';
 
@@ -113,6 +118,84 @@ describe('routing', () => {
   it('ignores the query string when routing', async () => {
     const { url } = await start();
     assert.equal((await fetch(`${url}/health?verbose=1`)).status, 200);
+  });
+});
+
+describe('/ingest routing', () => {
+  /** Starts a server whose ingest handler just records that it was reached. */
+  async function withIngest(mounted: boolean): Promise<{ url: string; calls: number }> {
+    const state = { calls: 0 };
+    const logLines: string[] = [];
+    const deps: ServerDeps = {
+      logger: createLogger({ write: (line) => logLines.push(line) }),
+      health: { version: '0.1.0', uptimeSeconds: () => 1, database: undefined },
+      ...(mounted
+        ? {
+            ingest: {
+              logger: createLogger({ write: () => {} }),
+              webhookSecret: undefined,
+              deliveries: undefined,
+              audit: undefined,
+            },
+          }
+        : {}),
+    };
+    const server = createHttpServer(deps);
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address() as AddressInfo;
+    return { url: `http://127.0.0.1:${port}`, get calls() { return state.calls; } };
+  }
+
+  it('routes POST /ingest to the handler', async () => {
+    const { url } = await withIngest(true);
+    const res = await fetch(`${url}/ingest`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    // No secret configured, so the handler answers 401 — which proves the
+    // request reached it rather than the 405 or 404 paths.
+    assert.equal(res.status, 401);
+  });
+
+  it('returns 404 when /ingest is not mounted', async () => {
+    const { url } = await withIngest(false);
+    const res = await fetch(`${url}/ingest`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    assert.equal(res.status, 404);
+  });
+
+  it('refuses GET on /ingest', async () => {
+    const { url } = await withIngest(true);
+    assert.equal((await fetch(`${url}/ingest`)).status, 405);
+  });
+
+  it('refuses POST on any other path', async () => {
+    const { url } = await withIngest(true);
+    for (const path of ['/health', '/health/ready', '/anything']) {
+      const res = await fetch(`${url}${path}`, { method: 'POST' });
+      assert.equal(res.status, 405, `POST ${path} was not refused`);
+    }
+  });
+
+  it('leaves the health endpoints untouched', async () => {
+    const { url } = await withIngest(true);
+    assert.equal((await fetch(`${url}/health`)).status, 200);
+    assert.equal((await fetch(`${url}/health/ready`)).status, 503);
+  });
+});
+
+describe('timeouts', () => {
+  it('bounds how long a request can occupy a connection', async () => {
+    // Neutara does not retry, so a stalled request costs an event.
+    const { server } = await start();
+    assert.equal(server.requestTimeout, REQUEST_TIMEOUT_MS);
+    assert.equal(server.headersTimeout, HEADERS_TIMEOUT_MS);
+    assert.ok(HEADERS_TIMEOUT_MS < REQUEST_TIMEOUT_MS);
   });
 });
 

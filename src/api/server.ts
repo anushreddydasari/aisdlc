@@ -10,11 +10,21 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 
 import type { Logger } from '../logging/logger.ts';
 import { buildLiveness, buildReadiness, type HealthDeps } from './health.ts';
+import { handleIngest, type IngestDeps } from './ingest.ts';
 
 export interface ServerDeps {
   readonly logger: Logger;
   readonly health: HealthDeps;
+  /** Absent means /ingest is not mounted at all. */
+  readonly ingest?: IngestDeps | undefined;
 }
+
+/**
+ * Neutara does not retry, so a slow or stalled request costs an event. These
+ * bound how long one can occupy a connection.
+ */
+export const REQUEST_TIMEOUT_MS = 30_000;
+export const HEADERS_TIMEOUT_MS = 10_000;
 
 function sendJson(res: ServerResponse, statusCode: number, body: unknown): void {
   const payload = JSON.stringify(body);
@@ -34,6 +44,21 @@ export async function handleRequest(
   // url is relative; the base is discarded and only the path is used.
   const path = new URL(req.url ?? '/', 'http://localhost').pathname;
   const method = req.method ?? 'GET';
+
+  // POST is accepted on /ingest and nowhere else.
+  if (path === '/ingest') {
+    if (method !== 'POST') {
+      sendJson(res, 405, { error: 'method_not_allowed' });
+      return;
+    }
+    if (deps.ingest === undefined) {
+      sendJson(res, 404, { error: 'not_found' });
+      return;
+    }
+    const result = await handleIngest(req, deps.ingest);
+    sendJson(res, result.statusCode, result.body);
+    return;
+  }
 
   if (method !== 'GET' && method !== 'HEAD') {
     sendJson(res, 405, { error: 'method_not_allowed' });
@@ -55,7 +80,7 @@ export async function handleRequest(
 }
 
 export function createHttpServer(deps: ServerDeps): Server {
-  return createServer((req, res) => {
+  const server = createServer((req, res) => {
     const startedAt = process.hrtime.bigint();
 
     res.on('finish', () => {
@@ -75,4 +100,8 @@ export function createHttpServer(deps: ServerDeps): Server {
       else res.end();
     });
   });
+
+  server.requestTimeout = REQUEST_TIMEOUT_MS;
+  server.headersTimeout = HEADERS_TIMEOUT_MS;
+  return server;
 }

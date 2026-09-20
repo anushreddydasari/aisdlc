@@ -6,8 +6,10 @@
  * an obscure error later on.
  */
 
-import { loadConfig, ConfigError } from './config/env.ts';
+import { loadConfig, loadWebhookConfig, ConfigError } from './config/env.ts';
 import { createConnectionManager } from './db/client.ts';
+import { createAuditLog } from './db/audit-log.ts';
+import { createWebhookDeliveryRepository } from './db/webhook-deliveries.ts';
 import { createLogger } from './logging/logger.ts';
 import { createHttpServer } from './api/server.ts';
 
@@ -43,12 +45,34 @@ async function main(): Promise<void> {
   const mongo = createConnectionManager({ uri: config.mongodbUri, logger });
   mongo.start();
 
+  const { webhookSecret } = loadWebhookConfig(process.env);
+  if (webhookSecret === undefined) {
+    // Mounted anyway, answering 401: refusing to start would take the health
+    // endpoints down with it, and .env.example specifies refusal per request.
+    logger.warn('NEUTARA_WEBHOOK_SECRET is not set; /ingest will reject every request');
+  }
+
   const server = createHttpServer({
     logger,
     health: {
       version: VERSION,
       uptimeSeconds: () => process.uptime(),
       database: mongo,
+    },
+    ingest: {
+      logger,
+      webhookSecret,
+      // Resolved per request: the connection manager reconnects in the
+      // background, so a database that comes back makes /ingest work again
+      // without a restart.
+      get deliveries() {
+        const db = mongo.db();
+        return db ? createWebhookDeliveryRepository(db, logger) : undefined;
+      },
+      get audit() {
+        const db = mongo.db();
+        return db ? createAuditLog(db, logger) : undefined;
+      },
     },
   });
 

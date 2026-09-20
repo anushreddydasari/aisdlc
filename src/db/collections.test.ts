@@ -17,6 +17,10 @@ import {
   INTAKE_SOURCES,
   INTAKE_STATUSES,
   OPERATOR_PRINCIPAL_PREFIX,
+  ACCEPTED_WEBHOOK_EVENTS,
+  WEBHOOK_DELIVERY_STATUSES,
+  WEBHOOK_DELIVERY_VALIDATOR,
+  WEBHOOK_EVENTS,
   OUTBOUND_WRITE_OPERATIONS,
   OUTBOUND_WRITE_STATUSES,
   OUTBOUND_WRITE_VALIDATOR,
@@ -329,13 +333,119 @@ describe('approval requires an operator, enforced by the database', () => {
   });
 });
 
+describe('webhookDeliveries validator', () => {
+  it('is attached with strict enforcement', () => {
+    const options = COLLECTION_OPTIONS[COLLECTIONS.webhookDeliveries];
+    assert.ok(options);
+    assert.equal(options['validationAction'], 'error');
+  });
+
+  it('constrains status and event to the approved vocabularies', () => {
+    const props = schemaOf(WEBHOOK_DELIVERY_VALIDATOR).properties;
+    assert.deepEqual(props['status']!['enum'], [...WEBHOOK_DELIVERY_STATUSES]);
+    // null is permitted because an unparseable delivery is still recorded.
+    assert.deepEqual(props['event']!['enum'], [...WEBHOOK_EVENTS, null]);
+  });
+
+  it('requires only what every delivery has, however malformed', () => {
+    // An authenticated but unparseable body has no event, issueKey or
+    // payload; it still has a body hash, a status and a timestamp.
+    assert.deepEqual([...schemaOf(WEBHOOK_DELIVERY_VALIDATOR).required].sort(), [
+      'attempts',
+      'deliveryId',
+      'maxAttempts',
+      'nextAttemptAt',
+      'receivedAt',
+      'status',
+    ]);
+  });
+
+  it('pins deliveryId to a sha256 hex digest', () => {
+    const pattern = schemaOf(WEBHOOK_DELIVERY_VALIDATOR).properties['deliveryId']!['pattern'];
+    assert.equal(pattern, '^[0-9a-f]{64}$');
+    assert.ok(new RegExp(String(pattern)).test('a'.repeat(64)));
+    assert.ok(!new RegExp(String(pattern)).test('A'.repeat(64)));
+    assert.ok(!new RegExp(String(pattern)).test('a'.repeat(63)));
+  });
+
+  it('allows the fields an unparseable delivery cannot supply to be null', () => {
+    const props = schemaOf(WEBHOOK_DELIVERY_VALIDATOR).properties;
+    for (const field of ['issueKey', 'eventTimestamp', 'payload', 'invalidReason', 'intakeItemId']) {
+      assert.ok(
+        (props[field]!['bsonType'] as string[]).includes('null'),
+        `${field} is not nullable`,
+      );
+    }
+  });
+});
+
+describe('webhook vocabularies', () => {
+  it('mirrors every event Neutara can send', () => {
+    // Taken from ConnectorEvent in Neutara's connector-service; this list is
+    // not ours to choose.
+    assert.deepEqual([...WEBHOOK_EVENTS], [
+      'issue.created',
+      'issue.updated',
+      'issue.deleted',
+      'issue.status_changed',
+      'issue.assigned',
+      'issue.commented',
+      'issue.department_changed',
+    ]);
+  });
+
+  it('accepts only issue.created for now', () => {
+    assert.deepEqual([...ACCEPTED_WEBHOOK_EVENTS], ['issue.created']);
+  });
+
+  it('only accepts events Neutara actually sends', () => {
+    for (const event of ACCEPTED_WEBHOOK_EVENTS) {
+      assert.ok((WEBHOOK_EVENTS as readonly string[]).includes(event));
+    }
+  });
+
+  it('defines the delivery lifecycle, including the Phase 4 states', () => {
+    assert.deepEqual([...WEBHOOK_DELIVERY_STATUSES], [
+      'pending',
+      'ignored',
+      'invalid',
+      'enriched',
+      'failed',
+    ]);
+  });
+
+  it('indexes the enrichment drain and the per-issue lookup', () => {
+    const names = INDEXES[COLLECTIONS.webhookDeliveries].map((i) => i.name);
+    assert.ok(names.includes('status_nextAttemptAt'), 'the Phase 4 drain is unindexed');
+    assert.ok(names.includes('issueKey_receivedAt'));
+    assert.ok(names.includes('deliveryId_unique'));
+  });
+});
+
 describe('collection options coverage', () => {
-  it('validates exactly the four collections with enforced vocabularies', () => {
+  it('validates exactly the five collections with enforced vocabularies', () => {
     assert.deepEqual(Object.keys(COLLECTION_OPTIONS).sort(), [
       'auditLog',
       'checkpoints',
       'intakeItems',
       'outboundWrites',
+      'webhookDeliveries',
     ]);
+  });
+});
+
+describe('Phase 1 invariants are untouched by Phase 3', () => {
+  it('leaves the intake status vocabulary unchanged', () => {
+    assert.deepEqual([...INTAKE_STATUSES], [
+      'received',
+      'pending_approval',
+      'approved',
+      'rejected',
+      'failed',
+    ]);
+  });
+
+  it('leaves the intake sources unchanged', () => {
+    assert.deepEqual([...INTAKE_SOURCES], ['webhook', 'manual', 'backfill']);
   });
 });

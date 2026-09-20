@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { ConfigError, isMongoUri, loadConfig, loadMigrationConfig } from './env.ts';
+import {
+  ConfigError,
+  isMongoUri,
+  loadConfig,
+  loadMigrationConfig,
+  loadWebhookConfig,
+} from './env.ts';
 
 /** A syntactically valid URI with an obvious fake password, for leak assertions. */
 const FAKE_PASSWORD = 'p4ssw0rd-should-never-be-logged';
@@ -202,5 +208,35 @@ describe('privilege separation between the two Atlas users', () => {
   it('does not fire when only one of the two is set', () => {
     // The service must start in Phase 0 with no migration URI configured.
     assert.equal(loadConfig(VALID_ENV).port, 8090);
+  });
+});
+
+describe('loadWebhookConfig', () => {
+  it('reads the webhook secret when present', () => {
+    assert.equal(loadWebhookConfig({ NEUTARA_WEBHOOK_SECRET: 'whsec_x' }).webhookSecret, 'whsec_x');
+  });
+
+  it('reports an absent secret rather than throwing', () => {
+    // The service must start without it: a Phase 0-2 checkout has no webhook
+    // configured, and /ingest answering 401 is a valid state.
+    assert.equal(loadWebhookConfig({}).webhookSecret, undefined);
+  });
+
+  it('treats a blank secret as absent', () => {
+    assert.equal(loadWebhookConfig({ NEUTARA_WEBHOOK_SECRET: '   ' }).webhookSecret, undefined);
+  });
+
+  it('trims surrounding whitespace', () => {
+    assert.equal(loadWebhookConfig({ NEUTARA_WEBHOOK_SECRET: '  s  ' }).webhookSecret, 's');
+  });
+
+  it('is not required by loadConfig, so the service still starts without it', () => {
+    const config = loadConfig(VALID_ENV);
+    assert.equal(config.port, 8090);
+  });
+
+  it('ignores the production database URIs entirely', () => {
+    const result = loadWebhookConfig({ ...VALID_ENV, NEUTARA_WEBHOOK_SECRET: 'whsec_x' });
+    assert.deepEqual(Object.keys(result), ['webhookSecret']);
   });
 });

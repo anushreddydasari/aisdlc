@@ -56,6 +56,47 @@ export type IntakeStatus = (typeof INTAKE_STATUSES)[number];
 export const INTAKE_SOURCES = ['webhook', 'manual', 'backfill'] as const;
 export type IntakeSource = (typeof INTAKE_SOURCES)[number];
 
+/**
+ * Events Neutara can send, taken from `ConnectorEvent` in its
+ * connector-service. This list mirrors the sender; it is not ours to choose.
+ */
+export const WEBHOOK_EVENTS = [
+  'issue.created',
+  'issue.updated',
+  'issue.deleted',
+  'issue.status_changed',
+  'issue.assigned',
+  'issue.commented',
+  'issue.department_changed',
+] as const;
+export type WebhookEvent = (typeof WEBHOOK_EVENTS)[number];
+
+/**
+ * Events that queue for enrichment. Everything else is recorded as `ignored`.
+ *
+ * Recorded rather than discarded: the delivery is signed evidence of what
+ * Neutara sent, and widening this list later should not leave a gap in the
+ * history.
+ */
+export const ACCEPTED_WEBHOOK_EVENTS: readonly WebhookEvent[] = ['issue.created'];
+
+export const WEBHOOK_DELIVERY_STATUSES = [
+  /** Valid and accepted; awaiting Phase 4 enrichment. */
+  'pending',
+  /** Valid, but the event type is not accepted. */
+  'ignored',
+  /** Authenticated but failed validation. `invalidReason` says why. */
+  'invalid',
+  /** Phase 4: an intake item was created. */
+  'enriched',
+  /** Phase 4: maxAttempts exhausted; needs a human. */
+  'failed',
+] as const;
+export type WebhookDeliveryStatus = (typeof WEBHOOK_DELIVERY_STATUSES)[number];
+
+/** Retry ceiling for Phase 4 enrichment, stored on each delivery. */
+export const WEBHOOK_DELIVERY_MAX_ATTEMPTS = 5;
+
 export const RUN_STATUSES = ['queued', 'running', 'succeeded', 'failed', 'cancelled'] as const;
 export type RunStatus = (typeof RUN_STATUSES)[number];
 
@@ -139,6 +180,10 @@ export const INDEXES: Readonly<Record<CollectionName, readonly IndexDefinition[]
       key: { receivedAt: 1 },
       options: { expireAfterSeconds: WEBHOOK_DELIVERY_RETENTION_SECONDS },
     },
+    // The Phase 4 enrichment drain: pending deliveries whose time has come.
+    { name: 'status_nextAttemptAt', key: { status: 1, nextAttemptAt: 1 } },
+    // "What have we heard about this issue?"
+    { name: 'issueKey_receivedAt', key: { issueKey: 1, receivedAt: -1 } },
   ],
   [COLLECTIONS.intakeItems]: [
     { name: 'issueKey_unique', key: { issueKey: 1 }, options: { unique: true } },
@@ -283,6 +328,42 @@ export const INTAKE_ITEM_VALIDATOR: Document = {
   $and: [INTAKE_ITEM_SCHEMA, APPROVAL_REQUIRES_OPERATOR_CLAUSE],
 };
 
+/**
+ * Validator for inbound webhook deliveries.
+ *
+ * `event`, `issueKey`, `eventTimestamp` and `payload` are nullable because an
+ * authenticated but malformed delivery is still recorded: the signature
+ * proves Neutara sent it, and it is the evidence that the upstream contract
+ * has drifted. When JSON.parse fails there is no object to store, so only the
+ * body hash in `deliveryId` identifies it.
+ */
+export const WEBHOOK_DELIVERY_VALIDATOR: Document = {
+  $jsonSchema: {
+    bsonType: 'object',
+    required: ['deliveryId', 'status', 'attempts', 'maxAttempts', 'nextAttemptAt', 'receivedAt'],
+    additionalProperties: true,
+    properties: {
+      // sha256 of the raw request body. Neutara sends no delivery id, so the
+      // body hash is the natural key: `timestamp` is inside the signed body,
+      // which makes each emission unique while a replay hashes identically.
+      deliveryId: { bsonType: 'string', pattern: '^[0-9a-f]{64}$' },
+      event: { enum: [...WEBHOOK_EVENTS, null] },
+      issueKey: { bsonType: ['string', 'null'] },
+      eventTimestamp: { bsonType: ['date', 'null'] },
+      payload: { bsonType: ['object', 'null'] },
+      status: { enum: [...WEBHOOK_DELIVERY_STATUSES] },
+      invalidReason: { bsonType: ['string', 'null'] },
+      attempts: { bsonType: 'int', minimum: 0 },
+      maxAttempts: { bsonType: 'int', minimum: 1 },
+      nextAttemptAt: { bsonType: 'date' },
+      lastError: { bsonType: ['object', 'null'] },
+      intakeItemId: { bsonType: ['objectId', 'null'] },
+      receivedAt: { bsonType: 'date' },
+      updatedAt: { bsonType: 'date' },
+    },
+  },
+};
+
 export const CHECKPOINT_VALIDATOR: Document = {
   $jsonSchema: {
     bsonType: 'object',
@@ -364,6 +445,11 @@ export const OUTBOUND_WRITE_MAX_ATTEMPTS = 5;
 
 /** Collections created with options, rather than implicitly on first write. */
 export const COLLECTION_OPTIONS: Partial<Record<CollectionName, Document>> = {
+  [COLLECTIONS.webhookDeliveries]: {
+    validator: WEBHOOK_DELIVERY_VALIDATOR,
+    validationLevel: 'strict',
+    validationAction: 'error',
+  },
   [COLLECTIONS.intakeItems]: {
     validator: INTAKE_ITEM_VALIDATOR,
     validationLevel: 'strict',

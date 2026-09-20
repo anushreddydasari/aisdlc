@@ -178,6 +178,26 @@ export function loadConfig(source: EnvSource): RuntimeConfig {
   return { mongodbUri, port, nodeEnv };
 }
 
+export const WEBHOOK_SECRET_VARIABLE = 'NEUTARA_WEBHOOK_SECRET';
+
+export interface WebhookConfig {
+  /** Absent means /ingest refuses every request. */
+  readonly webhookSecret: string | undefined;
+}
+
+/**
+ * The Phase 3 group.
+ *
+ * Deliberately NOT part of `loadConfig`: the service has to start without it,
+ * or a Phase 0-2 checkout could not run at all. An absent secret is a valid
+ * configuration in which `/ingest` answers 401 to everything, which is what
+ * .env.example specifies — never accept unsigned requests.
+ */
+export function loadWebhookConfig(source: EnvSource): WebhookConfig {
+  const secret = present(source, WEBHOOK_SECRET_VARIABLE);
+  return { webhookSecret: secret };
+}
+
 /** Validates the deploy-only migration group. Never called by the service. */
 export function loadMigrationConfig(source: EnvSource): MigrationConfig {
   const failures = new Failures();

@@ -290,6 +290,7 @@ describe('initializeDatabase', () => {
       'checkpoints',
       'intakeItems',
       'outboundWrites',
+      'webhookDeliveries',
     ]);
   });
 
@@ -298,7 +299,13 @@ describe('initializeDatabase', () => {
     await initializeDatabase(db, logger);
     // On a fresh database the validator arrives via createCollection.
     assert.deepEqual(recorded.collModded, []);
-    for (const name of ['auditLog', 'checkpoints', 'outboundWrites', 'intakeItems']) {
+    for (const name of [
+      'auditLog',
+      'checkpoints',
+      'outboundWrites',
+      'intakeItems',
+      'webhookDeliveries',
+    ]) {
       assert.ok(recorded.created.includes(name));
     }
   });

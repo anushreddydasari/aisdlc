@@ -43,8 +43,13 @@
  */
 
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import type { AddressInfo } from 'node:net';
 import { after, before, describe, it } from 'node:test';
 import { ObjectId, type Db } from 'mongodb';
+
+import { createHttpServer } from '../api/server.ts';
+import { buildSignatureHeader } from '../api/signature.ts';
 
 import { DATABASE_NAME, connect, type MongoConnection } from '../db/client.ts';
 import {
@@ -54,6 +59,7 @@ import {
   type AuditEntryDocument,
 } from '../db/audit-log.ts';
 import { COLLECTIONS } from '../db/collections.ts';
+import { createWebhookDeliveryRepository } from '../db/webhook-deliveries.ts';
 import { initializeDatabase } from '../db/indexes.ts';
 import { createLogger } from '../logging/logger.ts';
 import { resolveIntegrationConfig } from './integration-config.ts';
@@ -73,6 +79,18 @@ const logger = createLogger({ write: () => {} });
 const RUN_ID = new ObjectId().toHexString().slice(-8);
 const KEY_PREFIX = `ITEST-${RUN_ID}-`;
 const testKey = (n: number): string => `${KEY_PREFIX}${n}`;
+
+/** Deterministic so `after()` can clean up exactly what the tests created. */
+const DELIVERY_NAMES = ['accepted', 'dupe', 'invalid'] as const;
+const deliveryKey = (name: (typeof DELIVERY_NAMES)[number]): string =>
+  createHash('sha256').update(`${KEY_PREFIX}${name}`).digest('hex');
+
+/**
+ * Delivery ids a test cannot precompute, because they are the hash of a body
+ * built at run time. Registered here so cleanup still removes exactly what
+ * was created rather than guessing with a prefix match.
+ */
+const runtimeDeliveryIds: string[] = [];
 
 const SNAPSHOT: IntakeSnapshot = {
   title: 'Integration test item',
@@ -123,6 +141,11 @@ describe('intake repository against real Atlas', { skip: blocked }, () => {
         await app.db
           .collection(COLLECTIONS.intakeItems)
           .deleteMany({ issueKey: { $regex: `^${KEY_PREFIX}` } });
+        await app.db
+          .collection(COLLECTIONS.webhookDeliveries)
+          .deleteMany({
+            deliveryId: { $in: [...DELIVERY_NAMES.map(deliveryKey), ...runtimeDeliveryIds] },
+          });
       }
     } finally {
       // Always close both, even if cleanup threw. Skipping this leaves an
@@ -286,6 +309,150 @@ describe('intake repository against real Atlas', { skip: blocked }, () => {
     const guarded = guardAuditCollection(db.collection<AuditEntryDocument>(COLLECTIONS.auditLog));
     assert.throws(() => guarded.deleteMany({}), AuditLogMutationError);
     assert.throws(() => guarded.updateOne({}, {}), AuditLogMutationError);
+  });
+
+  it('accepts a webhook delivery and queues it as pending', async () => {
+    const deliveries = createWebhookDeliveryRepository(db, logger);
+    const deliveryId = deliveryKey('accepted');
+
+    const result = await deliveries.record({
+      deliveryId,
+      status: 'pending',
+      event: 'issue.created',
+      issueKey: testKey(10),
+      eventTimestamp: new Date(),
+      payload: { event: 'issue.created', issue: { key: testKey(10) } },
+    });
+    assert.ok(result.recorded);
+
+    const stored = await deliveries.findByDeliveryId(deliveryId);
+    assert.equal(stored?.status, 'pending');
+    assert.equal(stored?.intakeItemId, null, 'Phase 3 must not create an intake item');
+  });
+
+  it('rejects a duplicate delivery at the unique index', async () => {
+    const deliveries = createWebhookDeliveryRepository(db, logger);
+    const deliveryId = deliveryKey('dupe');
+
+    const first = await deliveries.record({ deliveryId, status: 'pending', issueKey: testKey(11) });
+    const second = await deliveries.record({ deliveryId, status: 'pending', issueKey: testKey(11) });
+
+    assert.ok(first.recorded);
+    assert.ok(!second.recorded);
+    assert.equal(second.id.toString(), first.id.toString());
+  });
+
+  it('stores an unparseable delivery with null event and payload', async () => {
+    // The signature proved Neutara sent it, so it is recorded as evidence
+    // even though nothing could be parsed out of it.
+    const deliveries = createWebhookDeliveryRepository(db, logger);
+    const deliveryId = deliveryKey('invalid');
+
+    await deliveries.record({ deliveryId, status: 'invalid', invalidReason: 'malformed_json' });
+    const stored = await deliveries.findByDeliveryId(deliveryId);
+
+    assert.equal(stored?.status, 'invalid');
+    assert.equal(stored?.event, null);
+    assert.equal(stored?.payload, null);
+  });
+
+  it('enforces the webhookDeliveries validator server-side', async () => {
+    // Bypasses the repository: the vocabulary must hold for any writer with
+    // the app credential, not only for callers going through our code.
+    await assert.rejects(
+      () =>
+        db.collection(COLLECTIONS.webhookDeliveries).insertOne({
+          deliveryId: 'not-a-sha256',
+          status: 'pending',
+          attempts: 0,
+          maxAttempts: 5,
+          nextAttemptAt: new Date(),
+          receivedAt: new Date(),
+        } as never),
+      /validation/i,
+      'the server accepted a malformed deliveryId',
+    );
+
+    await assert.rejects(
+      () =>
+        db.collection(COLLECTIONS.webhookDeliveries).insertOne({
+          deliveryId: 'c'.repeat(64),
+          status: 'not_a_real_status',
+          attempts: 0,
+          maxAttempts: 5,
+          nextAttemptAt: new Date(),
+          receivedAt: new Date(),
+        } as never),
+      /validation/i,
+      'the server accepted an unknown delivery status',
+    );
+  });
+
+  it('accepts a real signed POST to /ingest end to end', async () => {
+    // The one seam nothing else covers: a real server, a real socket, a real
+    // signature computed over the exact bytes sent, and a real row in Atlas.
+    // Every other webhook test stops at either side of the HTTP boundary.
+    const secret = `whsec_itest_${RUN_ID}`;
+    const deliveries = createWebhookDeliveryRepository(db, logger);
+
+    const server = createHttpServer({
+      logger,
+      health: { version: '0.0.0', uptimeSeconds: () => 0, database: undefined },
+      ingest: { logger, webhookSecret: secret, deliveries, audit: createAuditLog(db, logger) },
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+    try {
+      const { port } = server.address() as AddressInfo;
+      const issueKey = testKey(20);
+
+      // Serialised once: the signature covers these exact bytes, and fetch
+      // sends the same string unchanged.
+      const body = JSON.stringify({
+        event: 'issue.created',
+        timestamp: new Date().toISOString(),
+        issue: {
+          key: issueKey,
+          summary: 'End-to-end ingest test',
+          type: 'task',
+          priority: 'low',
+          spaceKey: 'ITEST',
+          url: `https://neutara.example.com/browse/${issueKey}`,
+        },
+      });
+      const raw = Buffer.from(body, 'utf8');
+      const deliveryId = createHash('sha256').update(raw).digest('hex');
+      runtimeDeliveryIds.push(deliveryId);
+
+      const response = await fetch(`http://127.0.0.1:${port}/ingest`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-neutara-signature': buildSignatureHeader(secret, raw),
+        },
+        body,
+      });
+
+      assert.equal(response.status, 202);
+      const json = (await response.json()) as Record<string, unknown>;
+      assert.equal(json['status'], 'accepted');
+      assert.equal(json['deliveryId'], deliveryId);
+      assert.equal(json['issueKey'], issueKey);
+
+      const stored = await deliveries.findByDeliveryId(deliveryId);
+      assert.ok(stored, 'the delivery was not persisted');
+      assert.equal(stored.deliveryId, deliveryId);
+      assert.equal(stored.issueKey, issueKey);
+      assert.equal(stored.event, 'issue.created');
+      assert.equal(stored.status, 'pending');
+      assert.equal(stored.intakeItemId, null);
+
+      // Phase 3 queues; it does not create intake items.
+      const intake = await db.collection(COLLECTIONS.intakeItems).findOne({ issueKey });
+      assert.equal(intake, null, 'Phase 3 created an intake item');
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 
   it('the DATABASE refuses audit mutation, not just our code', async () => {
