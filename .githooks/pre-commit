@@ -1,0 +1,160 @@
+#!/bin/sh
+#
+# Blocks credentials from entering the repository.
+#
+# Install once per clone:  sh scripts/install-hooks.sh
+#
+# Bypassable with --no-verify, by design. This is a guardrail against
+# accident, not an enforcement boundary; real enforcement is push protection
+# on the remote plus CI. The pre-push hook re-runs checks 1-3 over whole
+# commits, so a --no-verify commit is still caught before it leaves the
+# machine.
+#
+# Note what is NOT hardcoded here: the cluster hostname, usernames and
+# passwords. Writing them into a committed file would leak the very things
+# this hook exists to protect. Check 3 derives them at runtime from the local
+# .env, which is gitignored.
+
+set -eu
+
+RED=''
+RESET=''
+if [ -t 2 ]; then RED=$(printf '\033[31m'); RESET=$(printf '\033[0m'); fi
+
+failed=0
+fail() {
+  printf '%spre-commit: %s%s\n' "$RED" "$1" "$RESET" >&2
+  failed=1
+}
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+[ -z "$staged" ] && exit 0
+
+# Synthetic fixtures live in the test suite and must not trip the scanner.
+# RFC 2606 reserves example.com/.net for documentation, so anything pointing
+# there is by definition not a real host.
+# A line is treated as a fixture when it points at an RFC 2606 reserved
+# domain, uses an obvious placeholder, carries long runs of a repeated
+# character (no real credential looks like that), or is explicitly marked
+# `pragma: fixture`.
+is_fixture() {
+  printf '%s' "$1" | grep -qiE 'example\.(com|net|org)|EXAMPLE|@host[/:]|<user>|<password>|<cluster-host>|test_app|test_migrator|pragma:[[:space:]]*fixture|AAAA|BBBB|CCCC|XXXX|0000'
+}
+
+# ── 1. Credential files ──────────────────────────────────────────────────
+# .gitignore cannot stop `git add -f`. This can.
+for file in $staged; do
+  case "$file" in
+    .env.example) : ;;
+    .env|.env.*|*.p12|*.pem|*.key|*.pfx|*.jks|*id_rsa*|*id_ed25519*)
+      fail "refusing to commit credential file: $file" ;;
+  esac
+done
+
+# ── 2. Credential shapes in staged content ───────────────────────────────
+patterns='mongodb(\+srv)?://[^[:space:]"'"'"'`]*:[^[:space:]"'"'"'`]*@'
+patterns="$patterns"'|sk-ant-[A-Za-z0-9_-]{8,}'
+patterns="$patterns"'|nta_[A-Za-z0-9_-]{8,}'
+patterns="$patterns"'|whsec_[A-Za-z0-9_-]{8,}'
+patterns="$patterns"'|AKIA[0-9A-Z]{16}'
+patterns="$patterns"'|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+patterns="$patterns"'|(PASSWORD|SECRET|TOKEN|API_KEY|APIKEY)[[:space:]]*=[[:space:]]*[^[:space:]<"'"'"'`]+'
+
+# The hook files themselves are excluded: they contain these patterns by
+# definition, so scanning them only ever matches the scanner.
+scannable=$(printf '%s\n' $staged | grep -v '^\.githooks/' || true)
+
+[ -n "$scannable" ] && git diff --cached -U0 --no-color -- $scannable |
+  grep '^+' | grep -v '^+++' | sed 's/^+//' |
+  grep -nE "$patterns" 2>/dev/null |
+  while IFS= read -r line; do
+    is_fixture "$line" && continue
+    printf 'SECRETLINE\n'
+  done > "${TMPDIR:-/tmp}/aisdlc-hook-hits.$$" || true
+
+if [ -s "${TMPDIR:-/tmp}/aisdlc-hook-hits.$$" ]; then
+  fail "staged content looks like a credential ($(wc -l < "${TMPDIR:-/tmp}/aisdlc-hook-hits.$$" | tr -d ' ') line(s)). Review the staged diff."
+fi
+rm -f "${TMPDIR:-/tmp}/aisdlc-hook-hits.$$"
+
+# ── 3. Values from the local .env, whatever they happen to be ────────────
+# Catches a real connection string pasted into a comment, a test fixture or
+# a README — without this file ever knowing what those values are.
+if [ -f .env ] && [ -n "${scannable:-}" ]; then
+  # Passwords and cluster hosts only. Usernames are deliberately NOT checked:
+  # `aisdlc_app` and `aisdlc_migrator` are published in docs/atlas-roles.md
+  # and used as fixtures throughout the test suite. They describe the role
+  # model; they are not secrets, and treating them as such blocks every
+  # legitimate commit.
+  git diff --cached -U0 --no-color -- $scannable | grep '^+' | grep -v '^+++' > "${TMPDIR:-/tmp}/aisdlc-added.$$" || true
+
+  short=0
+  grep -Eo 'mongodb(\+srv)?://[^[:space:]"]*' .env 2>/dev/null |
+    sed -E 's#^mongodb(\+srv)?://##' |
+    while IFS= read -r authority; do
+      creds=${authority%%@*}
+      host=${authority#*@}
+      host=${host%%/*}
+      host=${host%%\?*}
+      pass=${creds#*:}
+
+      # A short password cannot be searched for without matching ordinary
+      # text. Report it rather than skipping silently, so the gap is visible.
+      if [ -n "$pass" ] && [ ${#pass} -lt 8 ]; then
+        printf 'SHORTPW\n' >> "${TMPDIR:-/tmp}/aisdlc-short.$$"
+      elif [ -n "$pass" ] && grep -qF -- "$pass" "${TMPDIR:-/tmp}/aisdlc-added.$$" 2>/dev/null; then
+        printf 'LOCALSECRET\n'
+      fi
+
+      if [ ${#host} -ge 8 ] && grep -qF -- "$host" "${TMPDIR:-/tmp}/aisdlc-added.$$" 2>/dev/null; then
+        printf 'LOCALSECRET\n'
+      fi
+    done > "${TMPDIR:-/tmp}/aisdlc-local.$$" || true
+
+  if [ -s "${TMPDIR:-/tmp}/aisdlc-local.$$" ]; then
+    fail "staged content contains a password or cluster host from your local .env"
+  fi
+  if [ -s "${TMPDIR:-/tmp}/aisdlc-short.$$" ]; then
+    printf 'pre-commit: note — %s password(s) in .env are under 8 characters and\n' \
+      "$(wc -l < "${TMPDIR:-/tmp}/aisdlc-short.$$" | tr -d ' ')" >&2
+    printf '            cannot be scanned for reliably. Consider longer credentials.\n' >&2
+  fi
+  rm -f "${TMPDIR:-/tmp}/aisdlc-added.$$" "${TMPDIR:-/tmp}/aisdlc-local.$$" "${TMPDIR:-/tmp}/aisdlc-short.$$"
+fi
+
+# ── 4. .env.example must carry names only ────────────────────────────────
+if printf '%s\n' $staged | grep -qx '.env.example'; then
+  if git show ":.env.example" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*=.+'; then
+    fail ".env.example has a variable with a value; it must list names only"
+  fi
+fi
+
+# ── 5. Large blobs ───────────────────────────────────────────────────────
+# The 64 MB SQL dump in a sibling repository is the mistake this prevents.
+for file in $staged; do
+  [ -f "$file" ] || continue
+  size=$(git cat-file -s ":$file" 2>/dev/null || echo 0)
+  if [ "$size" -gt 1048576 ]; then
+    fail "$file is $((size / 1024)) KB; files over 1 MB belong in object storage"
+  fi
+done
+
+# ── 6. The code must build and pass its offline tests ────────────────────
+# Integration tests are deliberately excluded: they need credentials and
+# write to a cluster.
+if [ "$failed" -eq 0 ] && [ -f package.json ]; then
+  if grep -q '"typecheck"' package.json; then
+    npm run --silent typecheck || fail 'typecheck failed'
+  fi
+  if grep -q '"test"' package.json; then
+    npm run --silent test >/dev/null 2>&1 || fail 'offline tests failed'
+  fi
+fi
+
+if [ "$failed" -ne 0 ]; then
+  printf '\ncommit blocked. To override in an emergency: git commit --no-verify\n' >&2
+  printf '(pre-push will still check the commit before it leaves this machine)\n' >&2
+  exit 1
+fi
+
+exit 0

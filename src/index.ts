@@ -1,0 +1,73 @@
+/**
+ * Service entrypoint.
+ *
+ * Order matters: configuration is validated before anything else, so a
+ * missing variable is a clean startup failure naming the variable rather than
+ * an obscure error later on.
+ */
+
+import { loadConfig, ConfigError } from './config/env.ts';
+import { createConnectionManager } from './db/client.ts';
+import { createLogger } from './logging/logger.ts';
+import { createHttpServer } from './api/server.ts';
+
+const VERSION = '0.1.0';
+
+async function main(): Promise<void> {
+  const bootLogger = createLogger({ level: 'info' });
+
+  let config;
+  try {
+    config = loadConfig(process.env);
+  } catch (error) {
+    if (error instanceof ConfigError) {
+      // Names the variables, never the values.
+      bootLogger.error('startup aborted: invalid configuration', {
+        variables: error.variables,
+        detail: error.message,
+      });
+      process.exitCode = 78; // EX_CONFIG
+      return;
+    }
+    throw error;
+  }
+
+  const logger = createLogger({
+    level: config.nodeEnv === 'production' ? 'info' : 'debug',
+    base: { service: 'aisdlc-service', env: config.nodeEnv, version: VERSION },
+  });
+
+  // Non-blocking: the server starts serving immediately and reports itself
+  // not-ready until the connection lands. A failed first attempt is retried
+  // with backoff rather than leaving the instance permanently unready.
+  const mongo = createConnectionManager({ uri: config.mongodbUri, logger });
+  mongo.start();
+
+  const server = createHttpServer({
+    logger,
+    health: {
+      version: VERSION,
+      uptimeSeconds: () => process.uptime(),
+      database: mongo,
+    },
+  });
+
+  server.listen(config.port, () => {
+    logger.info('http server listening', { port: config.port });
+  });
+
+  const shutdown = (signal: string): void => {
+    logger.info('shutting down', { signal });
+    server.close(() => {
+      void (async () => {
+        await mongo.close();
+        process.exit(0);
+      })();
+    });
+  };
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+}
+
+await main();

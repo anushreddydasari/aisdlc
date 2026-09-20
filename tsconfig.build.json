@@ -1,0 +1,7 @@
+{
+  "extends": "./tsconfig.json",
+  // integration-config.ts is no longer test-only: src/scripts/init-target.ts
+  // reuses its guard so there is one definition of "which database is safe to
+  // write to", so it is part of the build.
+  "exclude": ["dist", "node_modules", "src/**/*.test.ts"]
+}

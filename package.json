@@ -1,0 +1,28 @@
+{
+  "name": "aisdlc-service",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "AISDLC service — intake, approval gate and pipeline runtime.",
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --experimental-strip-types --disable-warning=ExperimentalWarning \"src/**/*.test.ts\"",
+    "start": "node --env-file-if-exists=.env dist/index.js",
+    "dev": "node --env-file-if-exists=.env --experimental-strip-types --disable-warning=ExperimentalWarning --watch src/index.ts",
+    "db:init": "node --env-file-if-exists=.env --experimental-strip-types --disable-warning=ExperimentalWarning src/scripts/init-indexes.ts",
+    "test:integration": "node --env-file-if-exists=.env --test --experimental-strip-types --disable-warning=ExperimentalWarning \"src/**/*.integration.test.ts\"",
+    "db:init:test": "node --env-file-if-exists=.env --experimental-strip-types --disable-warning=ExperimentalWarning src/scripts/init-indexes.ts --test",
+    "db:init:production": "node --env-file-if-exists=.env --experimental-strip-types --disable-warning=ExperimentalWarning src/scripts/init-indexes.ts --production"
+  },
+  "dependencies": {
+    "mongodb": "^6.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.9.3"
+  }
+}

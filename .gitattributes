@@ -1,0 +1,17 @@
+# Line endings.
+#
+# This repository is developed on Windows with core.autocrlf=true, which
+# rewrites LF to CRLF on checkout. That is harmless for TypeScript, but it
+# breaks shell scripts: a `#!/bin/sh` line ending in CR fails on Linux and
+# macOS with "bad interpreter". The git hooks are shell scripts, so without
+# this file the commit gate would silently stop working on any non-Windows
+# checkout.
+
+* text=auto
+
+# Shell scripts must keep LF wherever they are checked out.
+*.sh text eol=lf
+/.githooks/* text eol=lf
+
+# PowerShell is the mirror case: it wants CRLF.
+*.ps1 text eol=crlf

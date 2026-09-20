@@ -1,0 +1,84 @@
+#!/bin/sh
+#
+# Last check before anything leaves the machine.
+#
+# Scans the full content of every commit being pushed, not just the working
+# tree. This is what catches a commit made with --no-verify, a commit made
+# before the hooks were installed, and anything pulled in from another branch.
+#
+# Reads the ranges git supplies on stdin: <local ref> <local sha> <remote ref> <remote sha>
+
+set -eu
+
+RED=''
+RESET=''
+if [ -t 2 ]; then RED=$(printf '\033[31m'); RESET=$(printf '\033[0m'); fi
+
+failed=0
+fail() {
+  printf '%spre-push: %s%s\n' "$RED" "$1" "$RESET" >&2
+  failed=1
+}
+
+# Kept identical to the pre-commit hook: a line is a fixture when it points
+# at an RFC 2606 reserved domain, uses an obvious placeholder, carries long
+# runs of a repeated character, or is marked `pragma: fixture`.
+is_fixture() {
+  printf '%s' "$1" | grep -qiE 'example\.(com|net|org)|EXAMPLE|@host[/:]|<user>|<password>|<cluster-host>|test_app|test_migrator|pragma:[[:space:]]*fixture|AAAA|BBBB|CCCC|XXXX|0000'
+}
+
+patterns='mongodb(\+srv)?://[^[:space:]"'"'"'`]*:[^[:space:]"'"'"'`]*@'
+patterns="$patterns"'|sk-ant-[A-Za-z0-9_-]{8,}'
+patterns="$patterns"'|nta_[A-Za-z0-9_-]{8,}'
+patterns="$patterns"'|whsec_[A-Za-z0-9_-]{8,}'
+patterns="$patterns"'|AKIA[0-9A-Z]{16}'
+patterns="$patterns"'|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+
+ZERO='0000000000000000000000000000000000000000'
+
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+  [ "$local_sha" = "$ZERO" ] && continue   # branch deletion
+
+  if [ "$remote_sha" = "$ZERO" ]; then
+    # New branch: everything not already on some other remote ref.
+    range=$(git rev-list "$local_sha" --not --remotes 2>/dev/null || echo "$local_sha")
+  else
+    range=$(git rev-list "$remote_sha..$local_sha" 2>/dev/null || echo '')
+  fi
+  [ -z "$range" ] && continue
+
+  for commit in $range; do
+    # Credential files by path.
+    for file in $(git diff-tree --no-commit-id --name-only -r "$commit"); do
+      case "$file" in
+        .env.example) : ;;
+        .env|.env.*|*.p12|*.pem|*.key|*.pfx|*.jks|*id_rsa*|*id_ed25519*)
+          fail "commit ${commit%${commit#???????}} adds credential file: $file" ;;
+      esac
+    done
+
+    # Credential shapes in the content that commit introduced.
+    # The hook files are excluded: they contain these patterns by definition,
+    # so scanning them only ever matches the scanner.
+    hits=$(git show --format= --unified=0 --no-color "$commit" -- . ':(exclude).githooks/*' |
+             grep '^+' | grep -v '^+++' | sed 's/^+//' |
+             grep -E "$patterns" 2>/dev/null || true)
+    if [ -n "$hits" ]; then
+      printf '%s\n' "$hits" | while IFS= read -r line; do
+        is_fixture "$line" || printf 'HIT\n'
+      done > "${TMPDIR:-/tmp}/aisdlc-push.$$" || true
+      if [ -s "${TMPDIR:-/tmp}/aisdlc-push.$$" ]; then
+        fail "commit ${commit%${commit#???????}} introduces content that looks like a credential"
+      fi
+      rm -f "${TMPDIR:-/tmp}/aisdlc-push.$$"
+    fi
+  done
+done
+
+if [ "$failed" -ne 0 ]; then
+  printf '\npush blocked. A secret in history is not fixed by a follow-up commit:\n' >&2
+  printf 'rewrite the commit (git rebase -i / git reset) and rotate the credential.\n' >&2
+  exit 1
+fi
+
+exit 0
