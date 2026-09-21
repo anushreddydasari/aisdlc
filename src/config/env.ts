@@ -198,6 +198,61 @@ export function loadWebhookConfig(source: EnvSource): WebhookConfig {
   return { webhookSecret: secret };
 }
 
+export const DATABASE_NAME_VARIABLE = 'AISDLC_DATABASE_NAME';
+
+export type DatabaseNameResult =
+  | { readonly ok: true; readonly databaseName: string; readonly overridden: boolean }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * Decides which database the service writes to.
+ *
+ * In production the override is IGNORED. A deployment must not be able to
+ * point itself somewhere else through an environment variable, however the
+ * variable arrived.
+ *
+ * Outside production the override is REQUIRED, with no fallback. That is the
+ * point: a local service that silently defaults to `aisdlc` writes test
+ * traffic into production, and the failure is invisible until someone reads
+ * the data. Refusing to start is the safe direction. It is also refused if it
+ * names the production database, so "explicitly opting in to production from
+ * a dev machine" is not a thing this can be talked into.
+ */
+export function resolveDatabaseName(
+  source: EnvSource,
+  nodeEnv: NodeEnvironment,
+  productionDatabase: string,
+): DatabaseNameResult {
+  const override = present(source, DATABASE_NAME_VARIABLE);
+
+  if (nodeEnv === 'production') {
+    return { ok: true, databaseName: productionDatabase, overridden: false };
+  }
+
+  if (override === undefined) {
+    return {
+      ok: false,
+      reason:
+        `${DATABASE_NAME_VARIABLE} must be set when NODE_ENV is '${nodeEnv}'. ` +
+        'There is no default outside production, so a local service cannot ' +
+        `silently write to '${productionDatabase}'.`,
+    };
+  }
+
+  // Case-insensitive, matching the integration-test guard: MongoDB names are
+  // case-sensitive, but 'AISDLC' is not a safe target either.
+  if (override.toLowerCase() === productionDatabase.toLowerCase()) {
+    return {
+      ok: false,
+      reason:
+        `${DATABASE_NAME_VARIABLE} is '${override}', which is the production ` +
+        `database '${productionDatabase}'; refusing to run outside production`,
+    };
+  }
+
+  return { ok: true, databaseName: override, overridden: true };
+}
+
 export const NEUTARA_BASE_URL_VARIABLE = 'NEUTARA_API_BASE_URL';
 export const NEUTARA_TOKEN_VARIABLE = 'NEUTARA_API_TOKEN';
 

@@ -16,7 +16,9 @@
     "db:init": "node --env-file-if-exists=.env --experimental-strip-types --disable-warning=ExperimentalWarning src/scripts/init-indexes.ts",
     "test:integration": "node --env-file-if-exists=.env --test --experimental-strip-types --disable-warning=ExperimentalWarning \"src/**/*.integration.test.ts\"",
     "db:init:test": "node --env-file-if-exists=.env --experimental-strip-types --disable-warning=ExperimentalWarning src/scripts/init-indexes.ts --test",
-    "db:init:production": "node --env-file-if-exists=.env --experimental-strip-types --disable-warning=ExperimentalWarning src/scripts/init-indexes.ts --production"
+    "db:init:production": "node --env-file-if-exists=.env --experimental-strip-types --disable-warning=ExperimentalWarning src/scripts/init-indexes.ts --production",
+    "webhook:local": "node --env-file-if-exists=.env --experimental-strip-types --disable-warning=ExperimentalWarning src/scripts/send-test-webhook.ts",
+    "mock:neutara": "node --env-file-if-exists=.env --experimental-strip-types --disable-warning=ExperimentalWarning src/scripts/mock-neutara.ts"
   },
   "dependencies": {
     "mongodb": "^6.21.0"

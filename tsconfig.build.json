@@ -3,5 +3,16 @@
   // integration-config.ts is no longer test-only: src/scripts/init-target.ts
   // reuses its guard so there is one definition of "which database is safe to
   // write to", so it is part of the build.
-  "exclude": ["dist", "node_modules", "src/**/*.test.ts"]
+  //
+  // The two local-testing tools are excluded. A mock API server and a webhook
+  // sender are development aids; shipping them in the deployment artifact
+  // gives an operator a way to stand up a fake Neutara or fire a signed
+  // webhook from inside production, which nothing there should be able to do.
+  "exclude": [
+    "dist",
+    "node_modules",
+    "src/**/*.test.ts",
+    "src/scripts/mock-neutara.ts",
+    "src/scripts/send-test-webhook.ts"
+  ]
 }

@@ -6,8 +6,14 @@
  * an obscure error later on.
  */
 
-import { loadConfig, loadNeutaraConfig, loadWebhookConfig, ConfigError } from './config/env.ts';
-import { createConnectionManager } from './db/client.ts';
+import {
+  loadConfig,
+  loadNeutaraConfig,
+  loadWebhookConfig,
+  resolveDatabaseName,
+  ConfigError,
+} from './config/env.ts';
+import { DATABASE_NAME, createConnectionManager } from './db/client.ts';
 import { createAuditLog } from './db/audit-log.ts';
 import { createWebhookDeliveryRepository } from './db/webhook-deliveries.ts';
 import { createIntakeRepository } from './intake/repository.ts';
@@ -42,10 +48,27 @@ async function main(): Promise<void> {
     base: { service: 'aisdlc-service', env: config.nodeEnv, version: VERSION },
   });
 
+  // Which database, decided before anything connects. Outside production the
+  // override is mandatory, so a local run cannot default into `aisdlc`.
+  const target = resolveDatabaseName(process.env, config.nodeEnv, DATABASE_NAME);
+  if (!target.ok) {
+    logger.error('startup aborted: unsafe database target', { detail: target.reason });
+    process.exitCode = 78; // EX_CONFIG
+    return;
+  }
+  logger.info('database target resolved', {
+    database: target.databaseName,
+    overridden: target.overridden,
+  });
+
   // Non-blocking: the server starts serving immediately and reports itself
   // not-ready until the connection lands. A failed first attempt is retried
   // with backoff rather than leaving the instance permanently unready.
-  const mongo = createConnectionManager({ uri: config.mongodbUri, logger });
+  const mongo = createConnectionManager({
+    uri: config.mongodbUri,
+    logger,
+    databaseName: target.databaseName,
+  });
   mongo.start();
 
   const { webhookSecret } = loadWebhookConfig(process.env);

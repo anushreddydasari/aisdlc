@@ -9,6 +9,7 @@ import {
   loadNeutaraConfig,
   loadWebhookConfig,
   normalizeNeutaraBaseUrl,
+  resolveDatabaseName,
 } from './env.ts';
 
 /** A syntactically valid URI with an obvious fake password, for leak assertions. */
@@ -240,6 +241,82 @@ describe('loadWebhookConfig', () => {
   it('ignores the production database URIs entirely', () => {
     const result = loadWebhookConfig({ ...VALID_ENV, NEUTARA_WEBHOOK_SECRET: 'whsec_x' });
     assert.deepEqual(Object.keys(result), ['webhookSecret']);
+  });
+});
+
+describe('resolveDatabaseName', () => {
+  const PROD = 'aisdlc';
+
+  it('uses the production database in production', () => {
+    const result = resolveDatabaseName({}, 'production', PROD);
+    assert.ok(result.ok);
+    assert.equal(result.databaseName, PROD);
+    assert.equal(result.overridden, false);
+  });
+
+  it('IGNORES the override in production', () => {
+    // A deployment must not be able to point itself elsewhere through an
+    // environment variable, however that variable arrived.
+    const result = resolveDatabaseName({ AISDLC_DATABASE_NAME: 'somewhere_else' }, 'production', PROD);
+    assert.ok(result.ok);
+    assert.equal(result.databaseName, PROD);
+    assert.equal(result.overridden, false);
+  });
+
+  for (const nodeEnv of ['development', 'test'] as const) {
+    it(`applies the override in ${nodeEnv}`, () => {
+      const result = resolveDatabaseName({ AISDLC_DATABASE_NAME: 'aisdlc_test' }, nodeEnv, PROD);
+      assert.ok(result.ok);
+      assert.equal(result.databaseName, 'aisdlc_test');
+      assert.equal(result.overridden, true);
+    });
+
+    it(`refuses to start in ${nodeEnv} when the override is absent`, () => {
+      // No fallback: a local service that silently defaults to `aisdlc`
+      // writes test traffic into production, invisibly.
+      const result = resolveDatabaseName({}, nodeEnv, PROD);
+      assert.ok(!result.ok);
+      assert.match(result.reason, /AISDLC_DATABASE_NAME must be set/);
+      assert.match(result.reason, /no default outside production/);
+    });
+
+    it(`treats a blank override as absent in ${nodeEnv}`, () => {
+      assert.ok(!resolveDatabaseName({ AISDLC_DATABASE_NAME: '   ' }, nodeEnv, PROD).ok);
+    });
+
+    it(`refuses the production database by name in ${nodeEnv}`, () => {
+      const result = resolveDatabaseName({ AISDLC_DATABASE_NAME: PROD }, nodeEnv, PROD);
+      assert.ok(!result.ok);
+      assert.match(result.reason, /refusing to run outside production/);
+    });
+
+    it(`refuses a case variant of the production database in ${nodeEnv}`, () => {
+      for (const variant of ['AISDLC', 'Aisdlc', 'aiSDLC']) {
+        const result = resolveDatabaseName({ AISDLC_DATABASE_NAME: variant }, nodeEnv, PROD);
+        assert.ok(!result.ok, `${variant} was accepted`);
+      }
+    });
+  }
+
+  it('allows a name that merely contains the production name', () => {
+    const result = resolveDatabaseName({ AISDLC_DATABASE_NAME: 'aisdlc_local' }, 'development', PROD);
+    assert.ok(result.ok);
+    assert.equal(result.databaseName, 'aisdlc_local');
+  });
+
+  it('trims surrounding whitespace', () => {
+    const result = resolveDatabaseName({ AISDLC_DATABASE_NAME: '  aisdlc_test  ' }, 'test', PROD);
+    assert.ok(result.ok);
+    assert.equal(result.databaseName, 'aisdlc_test');
+  });
+
+  it('reports whether the value was overridden, so startup can log it', () => {
+    const prod = resolveDatabaseName({}, 'production', PROD);
+    assert.ok(prod.ok);
+    assert.equal(prod.overridden, false);
+    const dev = resolveDatabaseName({ AISDLC_DATABASE_NAME: 'x' }, 'development', PROD);
+    assert.ok(dev.ok);
+    assert.equal(dev.overridden, true);
   });
 });
 
