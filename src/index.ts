@@ -9,6 +9,7 @@
 import {
   loadConfig,
   loadNeutaraConfig,
+  loadOperatorConfig,
   loadWebhookConfig,
   resolveDatabaseName,
   resolveRuntimeMongoUri,
@@ -92,6 +93,12 @@ async function main(): Promise<void> {
     logger.warn('NEUTARA_WEBHOOK_SECRET is not set; /ingest will reject every request');
   }
 
+  const { operatorToken } = loadOperatorConfig(process.env);
+  if (operatorToken === undefined) {
+    // Same "mounted anyway, answers 401" choice as the webhook secret above.
+    logger.warn('OPERATOR_TOKEN is not set; the approval endpoints will reject every request');
+  }
+
   const server = createHttpServer({
     logger,
     health: {
@@ -112,6 +119,14 @@ async function main(): Promise<void> {
       get audit() {
         const db = mongo.db();
         return db ? createAuditLog(db, logger) : undefined;
+      },
+    },
+    approval: {
+      logger,
+      operatorToken,
+      get intake() {
+        const db = mongo.db();
+        return db ? createIntakeRepository(db, createAuditLog(db, logger), logger) : undefined;
       },
     },
   });

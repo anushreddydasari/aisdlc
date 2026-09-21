@@ -11,10 +11,14 @@
  * authenticate as the production identity. Like every other local-testing
  * script in this repo, it refuses to run against the production database.
  *
- * Reads the intake item through IntakeRepository.findByIssueKey() and never
- * calls any of its write methods — this script cannot modify the original
- * ticket data. It never contacts Neutara or any other external API besides
- * (optionally) OpenAI.
+ * Reads the intake item through IntakeRepository.findByIssueKey(). The only
+ * write this script makes to it is the state transition
+ * received -> pending_approval, once analysis freshly completes (see
+ * requirements/approval-transition.ts) — the original ticket content
+ * (snapshot, sourceHash) is never touched, so the item's identity and
+ * history stay intact; only its approval-gate status moves forward. It
+ * never contacts Neutara or any other external API besides (optionally)
+ * OpenAI.
  *
  * Analyzer selection mirrors loadNeutaraConfig's "absent is a valid state"
  * pattern: with OPENAI_API_KEY set, this uses the real LLM-backed analyzer
@@ -38,6 +42,7 @@ import { createRequirementsRepository } from '../requirements/repository.ts';
 import { createLlmRequirementsAnalyzer } from '../requirements/openai-analyzer.ts';
 import { shouldRecordUsage, type AnalysisUsage } from '../requirements/repository.ts';
 import { runRequirementsAgent, type RequirementsAgentDeps } from '../requirements/worker.ts';
+import { advanceToPendingApproval } from '../requirements/approval-transition.ts';
 import { createLogger } from '../logging/logger.ts';
 
 const logger = createLogger({ level: 'debug', base: { task: 'requirements:run' } });
@@ -129,6 +134,9 @@ try {
     if (shouldRecordUsage(outcome.outcome, capturedUsage)) {
       finalDocument = await requirements.recordUsage(item._id!, capturedUsage);
     }
+
+    const advance = await advanceToPendingApproval(item, outcome.outcome, { intake, logger });
+    logger.info('approval-gate advance decision', { issueKey, advance });
 
     console.log(JSON.stringify(finalDocument, null, 2));
   }

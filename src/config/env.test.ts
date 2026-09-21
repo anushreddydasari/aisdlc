@@ -9,6 +9,7 @@ import {
   loadConfig,
   loadMigrationConfig,
   loadNeutaraConfig,
+  loadOperatorConfig,
   loadWebhookConfig,
   mongoUsername,
   normalizeNeutaraBaseUrl,
@@ -245,6 +246,36 @@ describe('loadWebhookConfig', () => {
   it('ignores the production database URIs entirely', () => {
     const result = loadWebhookConfig({ ...VALID_ENV, NEUTARA_WEBHOOK_SECRET: 'whsec_x' });
     assert.deepEqual(Object.keys(result), ['webhookSecret']);
+  });
+});
+
+describe('loadOperatorConfig', () => {
+  it('reads the operator token when present', () => {
+    assert.equal(loadOperatorConfig({ OPERATOR_TOKEN: 'op_x' }).operatorToken, 'op_x');
+  });
+
+  it('reports an absent token rather than throwing', () => {
+    // The service must start without it: the approval endpoints answering
+    // 401 to everything is a valid state, not a startup failure.
+    assert.equal(loadOperatorConfig({}).operatorToken, undefined);
+  });
+
+  it('treats a blank token as absent', () => {
+    assert.equal(loadOperatorConfig({ OPERATOR_TOKEN: '   ' }).operatorToken, undefined);
+  });
+
+  it('trims surrounding whitespace', () => {
+    assert.equal(loadOperatorConfig({ OPERATOR_TOKEN: '  t  ' }).operatorToken, 't');
+  });
+
+  it('is not required by loadConfig, so the service still starts without it', () => {
+    const config = loadConfig(VALID_ENV);
+    assert.equal(config.port, 8090);
+  });
+
+  it('ignores variables belonging to other phases', () => {
+    const result = loadOperatorConfig({ ...VALID_ENV, OPERATOR_TOKEN: 'op_x' });
+    assert.deepEqual(Object.keys(result), ['operatorToken']);
   });
 });
 

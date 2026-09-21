@@ -109,6 +109,38 @@ instance that lost its database recovers on its own once the database returns;
 no restart is needed. The readiness ping is bounded at 2s so it always answers
 inside a typical probe deadline.
 
+## Approval gate
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /intake/:issueKey/approve` | Approves an intake item currently `pending_approval`. |
+| `POST /intake/:issueKey/reject` | Rejects it instead. |
+
+Both require `Authorization: Bearer <OPERATOR_TOKEN>` and a JSON body naming
+the operator: `{"operator": "jane", "reason": "optional"}`. `OPERATOR_TOKEN`
+proves the caller may act as an operator; `operator` in the body is who,
+recorded in the audit trail as `operator:jane` — never a service identity,
+so a pipeline cannot approve its own work. Unset `OPERATOR_TOKEN` behaves
+like an unset `NEUTARA_WEBHOOK_SECRET`: the routes stay mounted and answer
+`401` to everything rather than the service refusing to start.
+
+```console
+$ curl -X POST localhost:8090/intake/CF-33261/approve \
+    -H "Authorization: Bearer $OPERATOR_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"operator": "jane"}'
+{"issueKey":"CF-33261","status":"approved","approvedBy":"operator:jane","approvedAt":"...","statusReason":null}
+```
+
+| Status | Meaning |
+| --- | --- |
+| `200` | approved or rejected |
+| `401` | missing/wrong token, or `OPERATOR_TOKEN` unset |
+| `400` | malformed body, or missing/blank `operator` |
+| `404` | no intake item for that `issueKey` |
+| `409` | not currently `pending_approval`, or it changed mid-request — read it again and retry |
+| `503` | database unreachable |
+
 ## Configuration behaviour
 
 Every variable is read with **no literal fallback**. A missing or malformed one
@@ -142,6 +174,8 @@ src/
   db/audit-log.ts      the only supported way to touch auditLog
   db/indexes.ts        idempotent collection + index setup
   api/health.ts        liveness and readiness payloads
+  api/approval.ts      the human approval gate (approve/reject)
+  api/operator-auth.ts bearer-token verification for the approval gate
   api/server.ts        node:http server and routing
   logging/logger.ts    structured JSON logging with redaction
   scripts/init-indexes.ts   one-off database setup (migration user)

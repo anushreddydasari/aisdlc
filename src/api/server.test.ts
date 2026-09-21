@@ -189,6 +189,86 @@ describe('/ingest routing', () => {
   });
 });
 
+describe('/intake approval routing', () => {
+  async function withApproval(mounted: boolean): Promise<{ url: string }> {
+    const deps: ServerDeps = {
+      logger: createLogger({ write: () => {} }),
+      health: { version: '0.1.0', uptimeSeconds: () => 1, database: undefined },
+      ...(mounted
+        ? {
+            approval: {
+              logger: createLogger({ write: () => {} }),
+              operatorToken: undefined,
+              intake: undefined,
+            },
+          }
+        : {}),
+    };
+    const server = createHttpServer(deps);
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address() as AddressInfo;
+    return { url: `http://127.0.0.1:${port}` };
+  }
+
+  it('routes POST /intake/:issueKey/approve to the handler', async () => {
+    const { url } = await withApproval(true);
+    const res = await fetch(`${url}/intake/CF-1/approve`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    // No operator token configured, so the handler answers 401 — which
+    // proves the request reached it rather than the 405 or 404 paths.
+    assert.equal(res.status, 401);
+  });
+
+  it('routes POST /intake/:issueKey/reject to the handler', async () => {
+    const { url } = await withApproval(true);
+    const res = await fetch(`${url}/intake/CF-1/reject`, { method: 'POST' });
+    assert.equal(res.status, 401);
+  });
+
+  it('returns 404 when the approval routes are not mounted', async () => {
+    const { url } = await withApproval(false);
+    const res = await fetch(`${url}/intake/CF-1/approve`, { method: 'POST' });
+    assert.equal(res.status, 404);
+  });
+
+  it('refuses GET on an approval route', async () => {
+    const { url } = await withApproval(true);
+    assert.equal((await fetch(`${url}/intake/CF-1/approve`)).status, 405);
+  });
+
+  it('does not match an unrelated action segment', async () => {
+    // Falls through to the generic "POST anywhere but /ingest or an
+    // approval route" case, same as the /ingest sibling test above: any
+    // unmatched path answers 405 to POST, not 404 (404 is reserved for a
+    // GET/HEAD to an unknown path).
+    const { url } = await withApproval(true);
+    const res = await fetch(`${url}/intake/CF-1/delete`, { method: 'POST' });
+    assert.equal(res.status, 405);
+  });
+
+  it('url-decodes the issue key', async () => {
+    // Proves routing extracts and decodes the segment rather than passing
+    // the raw path through — a 401 (reached the handler) rather than a 404
+    // confirms the route matched.
+    const { url } = await withApproval(true);
+    const res = await fetch(`${url}/intake/CF%2F1/approve`, { method: 'POST' });
+    assert.equal(res.status, 401);
+  });
+
+  it('leaves /ingest and the health endpoints untouched', async () => {
+    const { url } = await withApproval(true);
+    assert.equal((await fetch(`${url}/health`)).status, 200);
+    assert.equal(
+      (await fetch(`${url}/ingest`, { method: 'POST', body: '{}' })).status,
+      404,
+    );
+  });
+});
+
 describe('timeouts', () => {
   it('bounds how long a request can occupy a connection', async () => {
     // Neutara does not retry, so a stalled request costs an event.

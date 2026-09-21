@@ -9,6 +9,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 
 import type { Logger } from '../logging/logger.ts';
+import { handleApproval, type ApprovalDeps } from './approval.ts';
 import { buildLiveness, buildReadiness, type HealthDeps } from './health.ts';
 import { handleIngest, type IngestDeps } from './ingest.ts';
 
@@ -17,7 +18,17 @@ export interface ServerDeps {
   readonly health: HealthDeps;
   /** Absent means /ingest is not mounted at all. */
   readonly ingest?: IngestDeps | undefined;
+  /**
+   * Present whenever the intake repository can be constructed — unlike
+   * /ingest, these routes stay mounted even without OPERATOR_TOKEN (it
+   * answers 401 to everything instead, the same "mounted but refuses"
+   * choice /ingest makes for an absent webhook secret).
+   */
+  readonly approval?: ApprovalDeps | undefined;
 }
+
+/** POST /intake/{issueKey}/approve or /reject. issueKey is opaque, so no slashes. */
+const APPROVAL_PATH = /^\/intake\/([^/]+)\/(approve|reject)$/;
 
 /**
  * Neutara does not retry, so a slow or stalled request costs an event. These
@@ -56,6 +67,22 @@ export async function handleRequest(
       return;
     }
     const result = await handleIngest(req, deps.ingest);
+    sendJson(res, result.statusCode, result.body);
+    return;
+  }
+
+  const approvalMatch = APPROVAL_PATH.exec(path);
+  if (approvalMatch) {
+    if (method !== 'POST') {
+      sendJson(res, 405, { error: 'method_not_allowed' });
+      return;
+    }
+    if (deps.approval === undefined) {
+      sendJson(res, 404, { error: 'not_found' });
+      return;
+    }
+    const [, issueKey, action] = approvalMatch as unknown as [string, string, 'approve' | 'reject'];
+    const result = await handleApproval(req, deps.approval, decodeURIComponent(issueKey), action);
     sendJson(res, result.statusCode, result.body);
     return;
   }

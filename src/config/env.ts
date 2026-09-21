@@ -198,6 +198,27 @@ export function loadWebhookConfig(source: EnvSource): WebhookConfig {
   return { webhookSecret: secret };
 }
 
+export const OPERATOR_TOKEN_VARIABLE = 'OPERATOR_TOKEN';
+
+export interface OperatorConfig {
+  /** Absent means the approval endpoints refuse every request. */
+  readonly operatorToken: string | undefined;
+}
+
+/**
+ * The Phase 6 group. Mirrors loadWebhookConfig exactly: absent is a valid
+ * state, not a startup failure — the service still serves health and
+ * ingest, only POST /intake/:issueKey/approve|reject answer 401 to
+ * everything until this is set. Deliberately separate from every other
+ * credential this service loads (NEUTARA_API_TOKEN, the Mongo URIs): an
+ * operator approving an intake item is a human decision, and nothing else
+ * this process does should be able to make it on their behalf.
+ */
+export function loadOperatorConfig(source: EnvSource): OperatorConfig {
+  const operatorToken = present(source, OPERATOR_TOKEN_VARIABLE);
+  return { operatorToken };
+}
+
 export const DATABASE_NAME_VARIABLE = 'AISDLC_DATABASE_NAME';
 
 export type DatabaseNameResult =
