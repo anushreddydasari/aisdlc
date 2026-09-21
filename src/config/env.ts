@@ -253,6 +253,112 @@ export function resolveDatabaseName(
   return { ok: true, databaseName: override, overridden: true };
 }
 
+/**
+ * Same string as TEST_APP_URI_VARIABLE in src/intake/integration-config.ts.
+ * Defined again here, deliberately not imported from there: that module's
+ * whole point is that the integration suite's configuration is DISJOINT from
+ * this one (see its own docstring, and the static source-scan tests that
+ * assert it references no production variable). This module has its own,
+ * separate reason to know the name — deciding which credential the running
+ * service authenticates with — so it gets its own constant rather than a
+ * cross-module import that would blur that boundary.
+ */
+export const TEST_APP_URI_VARIABLE = 'AISDLC_TEST_MONGODB_URI';
+
+export type MongoIdentity = 'production' | 'test';
+
+export type MongoUriResult =
+  | { readonly ok: true; readonly uri: string; readonly identity: MongoIdentity }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * The username portion of a mongodb(+srv):// URI, or null when the URI
+ * carries no credentials at all (a bare `host:port` authority). The
+ * trailing `@` is required so a credential-free URI like
+ * `mongodb://host:27017/db` isn't misread as username `host` — without it,
+ * the host:port before the path looks identical in shape to user:pass@.
+ * Never returns the password: the capture group stops at the first ':',
+ * which is exactly the username/password boundary in this URI form.
+ */
+export function mongoUsername(uri: string): string | null {
+  const match = /^mongodb(?:\+srv)?:\/\/([^:/@]+):[^/@]*@/.exec(uri);
+  return match ? match[1]! : null;
+}
+
+/**
+ * Decides which MongoDB credential the RUNNING SERVICE authenticates with.
+ * Separate from resolveDatabaseName on purpose: that function decides WHICH
+ * DATABASE a connection targets, this one decides WHICH IDENTITY makes the
+ * connection. The two are independent knobs, and conflating them is exactly
+ * how the service ended up authenticating as `aisdlc_app` — the production
+ * identity, whose Atlas role (`aisdlcAppRole`) is scoped only to `aisdlc.*` —
+ * while `AISDLC_DATABASE_NAME` pointed it at `aisdlc_test`, producing
+ * `user is not allowed to do action [find] on [aisdlc_test.webhookDeliveries]`
+ * only once a query actually ran, instead of a clear refusal at startup.
+ *
+ * In production this is unchanged: always RUNTIME_URI_VARIABLE, exactly as
+ * before this function existed.
+ *
+ * Outside production there is no fallback to the production URI, the same
+ * "no default outside production" stance resolveDatabaseName takes for the
+ * database name — and the result is refused outright if the test URI would
+ * authenticate as the same identity as the production one, whether by being
+ * byte-identical or merely sharing a username. `aisdlc_app`'s role is
+ * intentionally scoped to production only (see docs/atlas-roles.md); reusing
+ * its identity outside production is not a convenience, it is the same
+ * failure this function exists to catch at startup instead of at query time.
+ */
+export function resolveRuntimeMongoUri(
+  source: EnvSource,
+  nodeEnv: NodeEnvironment,
+  productionUri: string,
+): MongoUriResult {
+  if (nodeEnv === 'production') {
+    return { ok: true, uri: productionUri, identity: 'production' };
+  }
+
+  const testUri = present(source, TEST_APP_URI_VARIABLE);
+  if (testUri === undefined) {
+    return {
+      ok: false,
+      reason:
+        `${TEST_APP_URI_VARIABLE} must be set when NODE_ENV is '${nodeEnv}'. ` +
+        `There is no fallback to ${RUNTIME_URI_VARIABLE}, so a local run cannot ` +
+        'silently authenticate as the production identity.',
+    };
+  }
+  if (!isMongoUri(testUri)) {
+    return {
+      ok: false,
+      reason: `${TEST_APP_URI_VARIABLE} is invalid (expected a mongodb:// or mongodb+srv:// connection string)`,
+    };
+  }
+
+  if (testUri === productionUri) {
+    return {
+      ok: false,
+      reason:
+        `${TEST_APP_URI_VARIABLE} is identical to ${RUNTIME_URI_VARIABLE}; outside ` +
+        'production the service must authenticate with a dedicated test identity, ' +
+        'never the production one',
+    };
+  }
+
+  const testUser = mongoUsername(testUri);
+  const prodUser = mongoUsername(productionUri);
+  if (testUser !== null && testUser === prodUser) {
+    return {
+      ok: false,
+      reason:
+        `${TEST_APP_URI_VARIABLE} authenticates as the same identity as ` +
+        `${RUNTIME_URI_VARIABLE}; outside production it must use a dedicated test ` +
+        'application user, never the production one',
+    };
+  }
+
+  return { ok: true, uri: testUri, identity: 'test' };
+}
+
 export const NEUTARA_BASE_URL_VARIABLE = 'NEUTARA_API_BASE_URL';
 export const NEUTARA_TOKEN_VARIABLE = 'NEUTARA_API_TOKEN';
 
@@ -325,6 +431,38 @@ export function loadNeutaraConfig(source: EnvSource): NeutaraConfigResult {
   if (!normalized.ok) return { configured: false, reason: normalized.reason };
 
   return { configured: true, config: { baseUrl: normalized.baseUrl, token: token! } };
+}
+
+export const OPENAI_API_KEY_VARIABLE = 'OPENAI_API_KEY';
+export const OPENAI_MODEL_VARIABLE = 'OPENAI_MODEL';
+export const DEFAULT_OPENAI_MODEL = 'gpt-4.1';
+
+export interface OpenAiConfig {
+  readonly apiKey: string;
+  readonly model: string;
+}
+
+export type OpenAiConfigResult =
+  | { readonly configured: true; readonly config: OpenAiConfig }
+  | { readonly configured: false; readonly reason: string };
+
+/**
+ * Like NeutaraConfig, absent is a valid state: the Requirements Agent runs
+ * with its deterministic stub analyzer rather than refusing to start. This is
+ * what lets `npm test` and every existing unit test stay network-free — only
+ * a caller that explicitly sets OPENAI_API_KEY opts into a real LLM call.
+ */
+export function loadOpenAiConfig(source: EnvSource): OpenAiConfigResult {
+  const apiKey = present(source, OPENAI_API_KEY_VARIABLE);
+  if (apiKey === undefined) {
+    return {
+      configured: false,
+      reason: `${OPENAI_API_KEY_VARIABLE} not set; using the deterministic stub analyzer`,
+    };
+  }
+
+  const model = present(source, OPENAI_MODEL_VARIABLE) ?? DEFAULT_OPENAI_MODEL;
+  return { configured: true, config: { apiKey, model } };
 }
 
 /** Validates the deploy-only migration group. Never called by the service. */

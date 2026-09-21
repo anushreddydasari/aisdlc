@@ -66,6 +66,24 @@ describe('redaction', () => {
     }
   });
 
+  it('does not blank a number or boolean under a secret-shaped key', () => {
+    // promptTokens/completionTokens/totalTokens (LLM usage counts) all match
+    // the `token` substring but carry no secret — a real secret targeted by
+    // this pattern is always a string.
+    const out = redact({ promptTokens: 100, completionTokens: 50, hasToken: true }) as Record<
+      string,
+      unknown
+    >;
+    assert.equal(out['promptTokens'], 100);
+    assert.equal(out['completionTokens'], 50);
+    assert.equal(out['hasToken'], true);
+  });
+
+  it('still blanks a string under a secret-shaped key, even one that looks numeric', () => {
+    const out = redact({ apiToken: '12345' }) as Record<string, unknown>;
+    assert.equal(out['apiToken'], REDACTED);
+  });
+
   it('blanks a connection string appearing anywhere in a value', () => {
     const out = redact({ note: `connect via ${FAKE_URI} then retry` }) as Record<string, string>;
     assert.ok(!out['note']!.includes(FAKE_PASSWORD));
@@ -75,6 +93,7 @@ describe('redaction', () => {
   it('blanks known token shapes in free text', () => {
     const cases = [
       'sk-ant-api03-AAAAAAAABBBBBBBBCCCCCCCC',
+      'sk-proj-AAAAAAAABBBBBBBBCCCCCCCC',
       'nta_AAAAAAAABBBBBBBBCCCCCCCC',
       'AKIAIOSFODNN7EXAMPLE',
     ];

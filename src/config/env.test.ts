@@ -3,13 +3,17 @@ import { describe, it } from 'node:test';
 
 import {
   ConfigError,
+  DEFAULT_OPENAI_MODEL,
   isMongoUri,
+  loadOpenAiConfig,
   loadConfig,
   loadMigrationConfig,
   loadNeutaraConfig,
   loadWebhookConfig,
+  mongoUsername,
   normalizeNeutaraBaseUrl,
   resolveDatabaseName,
+  resolveRuntimeMongoUri,
 } from './env.ts';
 
 /** A syntactically valid URI with an obvious fake password, for leak assertions. */
@@ -320,6 +324,166 @@ describe('resolveDatabaseName', () => {
   });
 });
 
+describe('mongoUsername', () => {
+  it('extracts the username and never the password', () => {
+    assert.equal(mongoUsername(`mongodb+srv://aisdlc_app:${FAKE_PASSWORD}@cluster0.example.mongodb.net/aisdlc`), 'aisdlc_app');
+    assert.equal(mongoUsername(`mongodb://someuser:${FAKE_PASSWORD}@host:27017/db`), 'someuser');
+  });
+
+  it('is null when the URI carries no credentials', () => {
+    assert.equal(mongoUsername('mongodb://host:27017/db'), null);
+  });
+});
+
+describe('resolveRuntimeMongoUri', () => {
+  const PROD_URI = `mongodb+srv://aisdlc_app:${FAKE_PASSWORD}@cluster0.example.mongodb.net/aisdlc`;
+  const TEST_URI = `mongodb+srv://aisdlc-test-app:${FAKE_PASSWORD}@cluster0.example.mongodb.net/aisdlc_test`;
+
+  describe('production', () => {
+    it('always uses the production URI (d. production mode remains unchanged)', () => {
+      const result = resolveRuntimeMongoUri({}, 'production', PROD_URI);
+      assert.ok(result.ok);
+      assert.equal(result.uri, PROD_URI);
+      assert.equal(result.identity, 'production');
+    });
+
+    it('ignores AISDLC_TEST_MONGODB_URI even when present', () => {
+      // Production must use ONLY the production configuration, however the
+      // test variable arrived in the environment.
+      const result = resolveRuntimeMongoUri(
+        { AISDLC_TEST_MONGODB_URI: TEST_URI },
+        'production',
+        PROD_URI,
+      );
+      assert.ok(result.ok);
+      assert.equal(result.uri, PROD_URI);
+      assert.equal(result.identity, 'production');
+    });
+  });
+
+  for (const nodeEnv of ['development', 'test'] as const) {
+    describe(nodeEnv, () => {
+      it('selects the dedicated test URI (a.)', () => {
+        const result = resolveRuntimeMongoUri({ AISDLC_TEST_MONGODB_URI: TEST_URI }, nodeEnv, PROD_URI);
+        assert.ok(result.ok);
+        assert.equal(result.uri, TEST_URI);
+        assert.equal(result.identity, 'test');
+      });
+
+      it('requires AISDLC_TEST_MONGODB_URI, with no fallback to the production URI', () => {
+        const result = resolveRuntimeMongoUri({}, nodeEnv, PROD_URI);
+        assert.ok(!result.ok);
+        assert.match(result.reason, /AISDLC_TEST_MONGODB_URI must be set/);
+      });
+
+      it('treats a blank value as absent', () => {
+        const result = resolveRuntimeMongoUri({ AISDLC_TEST_MONGODB_URI: '   ' }, nodeEnv, PROD_URI);
+        assert.ok(!result.ok);
+      });
+
+      it('rejects a malformed test URI', () => {
+        const result = resolveRuntimeMongoUri(
+          { AISDLC_TEST_MONGODB_URI: 'not-a-uri' },
+          nodeEnv,
+          PROD_URI,
+        );
+        assert.ok(!result.ok);
+        assert.match(result.reason, /AISDLC_TEST_MONGODB_URI is invalid/);
+      });
+
+      it('rejects the production URI/identity when byte-identical (b.)', () => {
+        const result = resolveRuntimeMongoUri({ AISDLC_TEST_MONGODB_URI: PROD_URI }, nodeEnv, PROD_URI);
+        assert.ok(!result.ok);
+        assert.match(result.reason, /identical/);
+      });
+
+      it('rejects the production identity even behind a different URI tail (b.)', () => {
+        // Same username as PROD_URI, different host/db — this is exactly the
+        // shape of mistake a full-string comparison alone would miss.
+        const sameIdentityDifferentTail = `mongodb+srv://aisdlc_app:${FAKE_PASSWORD}@other-cluster.example.mongodb.net/aisdlc_test`;
+        const result = resolveRuntimeMongoUri(
+          { AISDLC_TEST_MONGODB_URI: sameIdentityDifferentTail },
+          nodeEnv,
+          PROD_URI,
+        );
+        assert.ok(!result.ok);
+        assert.match(result.reason, /same identity/);
+      });
+
+      it('accepts a genuinely different test identity', () => {
+        const result = resolveRuntimeMongoUri({ AISDLC_TEST_MONGODB_URI: TEST_URI }, nodeEnv, PROD_URI);
+        assert.ok(result.ok);
+        assert.equal(result.identity, 'test');
+      });
+    });
+  }
+
+  describe('c. combined with resolveDatabaseName: dev/test requires both a dedicated URI and aisdlc_test', () => {
+    for (const nodeEnv of ['development', 'test'] as const) {
+      it(`${nodeEnv}: the database-name override is still mandatory (existing guarantee, unchanged)`, () => {
+        // resolveRuntimeMongoUri and resolveDatabaseName are independent
+        // knobs; this asserts the pre-existing database-name guarantee still
+        // holds alongside the new credential guarantee.
+        const uriResult = resolveRuntimeMongoUri({ AISDLC_TEST_MONGODB_URI: TEST_URI }, nodeEnv, PROD_URI);
+        const dbResult = resolveDatabaseName({}, nodeEnv, 'aisdlc');
+        assert.ok(uriResult.ok);
+        assert.ok(!dbResult.ok);
+      });
+
+      it(`${nodeEnv}: both resolve together for a correctly configured aisdlc_test run`, () => {
+        const uriResult = resolveRuntimeMongoUri({ AISDLC_TEST_MONGODB_URI: TEST_URI }, nodeEnv, PROD_URI);
+        const dbResult = resolveDatabaseName({ AISDLC_DATABASE_NAME: 'aisdlc_test' }, nodeEnv, 'aisdlc');
+        assert.ok(uriResult.ok);
+        assert.ok(dbResult.ok);
+        assert.equal(uriResult.identity, 'test');
+        assert.equal(dbResult.databaseName, 'aisdlc_test');
+      });
+    }
+  });
+
+  describe('e. secrets are not exposed in logs', () => {
+    const uriWithSecret = `mongodb+srv://aisdlc-test-app:${FAKE_PASSWORD}@secret-cluster.example.mongodb.net/aisdlc_test`;
+
+    it('never includes the password in a failure reason', () => {
+      for (const scenario of [
+        () => resolveRuntimeMongoUri({}, 'development', PROD_URI),
+        () => resolveRuntimeMongoUri({ AISDLC_TEST_MONGODB_URI: PROD_URI }, 'development', PROD_URI),
+        () => resolveRuntimeMongoUri({ AISDLC_TEST_MONGODB_URI: 'not-a-uri' }, 'development', PROD_URI),
+      ]) {
+        const result = scenario();
+        assert.ok(!result.ok);
+        assert.ok(!result.reason.includes(FAKE_PASSWORD), 'the password reached the failure reason');
+      }
+    });
+
+    it('never includes the host or a full connection string in a failure reason', () => {
+      const result = resolveRuntimeMongoUri({ AISDLC_TEST_MONGODB_URI: uriWithSecret }, 'development', uriWithSecret);
+      assert.ok(!result.ok);
+      assert.ok(!result.reason.includes('secret-cluster'));
+      assert.ok(!result.reason.includes('mongodb+srv://'));
+    });
+
+    it('never includes a username in a failure reason', () => {
+      const sameIdentityDifferentTail = `mongodb+srv://aisdlc_app:${FAKE_PASSWORD}@other.example.mongodb.net/aisdlc_test`;
+      const result = resolveRuntimeMongoUri(
+        { AISDLC_TEST_MONGODB_URI: sameIdentityDifferentTail },
+        'development',
+        PROD_URI,
+      );
+      assert.ok(!result.ok);
+      assert.ok(!result.reason.includes('aisdlc_app'), 'the username reached the failure reason');
+    });
+
+    it('a successful result never carries the password outside the uri field a caller must already have', () => {
+      // The uri field necessarily carries the connection string — callers
+      // need it to connect — but nothing else in the result shape should.
+      const result = resolveRuntimeMongoUri({ AISDLC_TEST_MONGODB_URI: TEST_URI }, 'development', PROD_URI);
+      assert.ok(result.ok);
+      assert.deepEqual(Object.keys(result).sort(), ['identity', 'ok', 'uri']);
+    });
+  });
+});
+
 /** An obviously fake token, used to assert it never reaches a message. */
 const FAKE_TOKEN = 'nta_not_a_real_token_value'; // pragma: fixture
 const NEUTARA_ENV = {
@@ -498,5 +662,60 @@ describe('loadNeutaraConfig', () => {
     });
     assert.ok(result.configured);
     assert.deepEqual(Object.keys(result.config).sort(), ['baseUrl', 'token']);
+  });
+});
+
+/** An obviously fake key, used to assert it never reaches a message. */
+const FAKE_OPENAI_KEY = 'sk-test-not-a-real-key-fixture-value'; // pragma: fixture
+
+describe('loadOpenAiConfig', () => {
+  it('resolves with the default model when only the key is set', () => {
+    const result = loadOpenAiConfig({ OPENAI_API_KEY: FAKE_OPENAI_KEY });
+    assert.ok(result.configured);
+    assert.equal(result.config.apiKey, FAKE_OPENAI_KEY);
+    assert.equal(result.config.model, DEFAULT_OPENAI_MODEL);
+  });
+
+  it('honours an explicit model override', () => {
+    const result = loadOpenAiConfig({
+      OPENAI_API_KEY: FAKE_OPENAI_KEY,
+      OPENAI_MODEL: 'gpt-4o',
+    });
+    assert.ok(result.configured);
+    assert.equal(result.config.model, 'gpt-4o');
+  });
+
+  it('reports not configured, rather than throwing, when the key is absent', () => {
+    // Absent is a valid state: the Requirements Agent falls back to the
+    // deterministic stub instead of refusing to run.
+    const result = loadOpenAiConfig({});
+    assert.ok(!result.configured);
+    assert.match(result.reason, /OPENAI_API_KEY/);
+    assert.match(result.reason, /deterministic stub/);
+  });
+
+  it('treats a blank key as absent', () => {
+    assert.ok(!loadOpenAiConfig({ OPENAI_API_KEY: '   ' }).configured);
+  });
+
+  it('trims surrounding whitespace on the model', () => {
+    const result = loadOpenAiConfig({
+      OPENAI_API_KEY: FAKE_OPENAI_KEY,
+      OPENAI_MODEL: '  gpt-4o  ',
+    });
+    assert.ok(result.configured);
+    assert.equal(result.config.model, 'gpt-4o');
+  });
+
+  it('never includes the key in the not-configured reason', () => {
+    const result = loadOpenAiConfig({ OPENAI_MODEL: 'gpt-4o' });
+    assert.ok(!result.configured);
+    assert.ok(!result.reason.includes(FAKE_OPENAI_KEY));
+  });
+
+  it('ignores variables belonging to other phases', () => {
+    const result = loadOpenAiConfig({ ...VALID_ENV, OPENAI_API_KEY: FAKE_OPENAI_KEY });
+    assert.ok(result.configured);
+    assert.deepEqual(Object.keys(result.config).sort(), ['apiKey', 'model']);
   });
 });

@@ -24,6 +24,8 @@ import {
   OUTBOUND_WRITE_OPERATIONS,
   OUTBOUND_WRITE_STATUSES,
   OUTBOUND_WRITE_VALIDATOR,
+  REQUIREMENTS_ANALYSIS_STATUSES,
+  REQUIREMENTS_ANALYSIS_VALIDATOR,
   WEBHOOK_DELIVERY_RETENTION_SECONDS,
   allIndexes,
 } from './collections.ts';
@@ -34,6 +36,7 @@ const APPROVED_COLLECTIONS = [
   'checkpoints',
   'intakeItems',
   'outboundWrites',
+  'requirementsAnalyses',
   'runArtifacts',
   'runs',
   'webhookDeliveries',
@@ -110,6 +113,8 @@ describe('index definitions', () => {
       'checkpoints.runId_step_unique',
       // A redelivered webhook must not create a second intake item.
       'intakeItems.issueKey_unique',
+      // One requirements analysis per intake item; a retry updates it in place.
+      'requirementsAnalyses.intakeItemId_unique',
       'webhookDeliveries.deliveryId_unique',
     ].sort());
   });
@@ -166,6 +171,10 @@ describe('status vocabularies', () => {
 
   it('sets the inline checkpoint output ceiling to 16 KB', () => {
     assert.equal(CHECKPOINT_INLINE_OUTPUT_MAX_BYTES, 16_384);
+  });
+
+  it('defines the approved requirements-analysis statuses', () => {
+    assert.deepEqual([...REQUIREMENTS_ANALYSIS_STATUSES], ['pending', 'completed', 'failed']);
   });
 });
 
@@ -441,13 +450,57 @@ describe('webhook vocabularies', () => {
   });
 });
 
+describe('requirementsAnalyses validator', () => {
+  it('is attached with strict enforcement', () => {
+    const options = COLLECTION_OPTIONS[COLLECTIONS.requirementsAnalyses];
+    assert.ok(options);
+    assert.equal(options['validationLevel'], 'strict');
+    assert.equal(options['validationAction'], 'error');
+  });
+
+  it('constrains status to the approved vocabulary', () => {
+    assert.deepEqual(schemaOf(REQUIREMENTS_ANALYSIS_VALIDATOR).properties['status']!['enum'], [
+      ...REQUIREMENTS_ANALYSIS_STATUSES,
+    ]);
+  });
+
+  it('requires the fields the retry/duplicate guard depends on', () => {
+    const { required } = schemaOf(REQUIREMENTS_ANALYSIS_VALIDATOR);
+    for (const field of ['intakeItemId', 'issueKey', 'status', 'inputHash', 'attempts', 'agentVersion']) {
+      assert.ok(required.includes(field), `${field} is not required`);
+    }
+  });
+
+  it('uses ObjectId for the intake item reference', () => {
+    assert.equal(
+      schemaOf(REQUIREMENTS_ANALYSIS_VALIDATOR).properties['intakeItemId']!['bsonType'],
+      'objectId',
+    );
+  });
+
+  it('allows result and error to be null, and neither is required', () => {
+    const { required, properties } = schemaOf(REQUIREMENTS_ANALYSIS_VALIDATOR);
+    assert.deepEqual(properties['result']!['bsonType'], ['object', 'null']);
+    assert.deepEqual(properties['error']!['bsonType'], ['object', 'null']);
+    assert.ok(!required.includes('result'));
+    assert.ok(!required.includes('error'));
+  });
+
+  it('allows usage to be null and does not require it, set only for an LLM-backed run', () => {
+    const { required, properties } = schemaOf(REQUIREMENTS_ANALYSIS_VALIDATOR);
+    assert.deepEqual(properties['usage']!['bsonType'], ['object', 'null']);
+    assert.ok(!required.includes('usage'));
+  });
+});
+
 describe('collection options coverage', () => {
-  it('validates exactly the five collections with enforced vocabularies', () => {
+  it('validates exactly the six collections with enforced vocabularies', () => {
     assert.deepEqual(Object.keys(COLLECTION_OPTIONS).sort(), [
       'auditLog',
       'checkpoints',
       'intakeItems',
       'outboundWrites',
+      'requirementsAnalyses',
       'webhookDeliveries',
     ]);
   });

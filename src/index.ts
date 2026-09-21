@@ -11,6 +11,7 @@ import {
   loadNeutaraConfig,
   loadWebhookConfig,
   resolveDatabaseName,
+  resolveRuntimeMongoUri,
   ConfigError,
 } from './config/env.ts';
 import { DATABASE_NAME, createConnectionManager } from './db/client.ts';
@@ -56,16 +57,29 @@ async function main(): Promise<void> {
     process.exitCode = 78; // EX_CONFIG
     return;
   }
+  // Which credential, decided independently of which database. Outside
+  // production this can never be the production identity (`aisdlc_app`),
+  // even though AISDLC_DATABASE_NAME already points elsewhere — the two used
+  // to be conflated, which is how the service ended up authenticating as
+  // aisdlc_app against aisdlc_test and failing at query time instead of here.
+  const credential = resolveRuntimeMongoUri(process.env, config.nodeEnv, config.mongodbUri);
+  if (!credential.ok) {
+    logger.error('startup aborted: unsafe mongodb credential', { detail: credential.reason });
+    process.exitCode = 78; // EX_CONFIG
+    return;
+  }
+
   logger.info('database target resolved', {
     database: target.databaseName,
     overridden: target.overridden,
+    identity: credential.identity,
   });
 
   // Non-blocking: the server starts serving immediately and reports itself
   // not-ready until the connection lands. A failed first attempt is retried
   // with backoff rather than leaving the instance permanently unready.
   const mongo = createConnectionManager({
-    uri: config.mongodbUri,
+    uri: credential.uri,
     logger,
     databaseName: target.databaseName,
   });

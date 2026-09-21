@@ -33,6 +33,7 @@ const SECRET_KEY_PATTERN =
 const SECRET_VALUE_PATTERNS: readonly RegExp[] = [
   /mongodb(\+srv)?:\/\/\S*:\S*@\S*/gi, // connection string carrying inline credentials
   /\bsk-ant-[A-Za-z0-9_-]{8,}/g, // Anthropic API key
+  /\bsk-proj-[A-Za-z0-9_-]{8,}/g, // OpenAI project-scoped API key
   /\bnta_[A-Za-z0-9_-]{8,}/g, // Neutara personal API token
   /\bAKIA[0-9A-Z]{16}\b/g, // AWS access key id
 ];
@@ -74,7 +75,15 @@ export function redact(value: unknown, depth = 0): unknown {
   if (typeof value === 'object') {
     const out: Record<string, unknown> = {};
     for (const [key, inner] of Object.entries(value as Record<string, unknown>)) {
-      out[key] = SECRET_KEY_PATTERN.test(key) ? REDACTED : redact(inner, depth + 1);
+      // A real secret this pattern targets (password, token, api key, URI)
+      // is always a string. A number or boolean under a secret-shaped key —
+      // e.g. `promptTokens` matching `token` — is never wholesale-redacted:
+      // there is no secret to protect, and blanket-redacting it would only
+      // destroy genuinely useful, non-sensitive data (see the LLM analyzers'
+      // usage logging, which needed exactly this).
+      const looksSecret = SECRET_KEY_PATTERN.test(key);
+      const isNonStringPrimitive = typeof inner === 'number' || typeof inner === 'boolean';
+      out[key] = looksSecret && !isNonStringPrimitive ? REDACTED : redact(inner, depth + 1);
     }
     return out;
   }

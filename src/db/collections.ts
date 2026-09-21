@@ -26,6 +26,12 @@ export const COLLECTIONS = {
   /** Transactional outbox for writes back to Neutara. */
   outboundWrites: 'outboundWrites',
   /**
+   * Structured requirements produced from an intake item's snapshot, for the
+   * later Coding Agent. One row per intake item; the original intakeItems
+   * document is never written to by this stage.
+   */
+  requirementsAnalyses: 'requirementsAnalyses',
+  /**
    * Append-only record of every state change. Enforced by the database:
    * aisdlcAppRole grants `find` and `insert` on this collection and nothing
    * else. See docs/atlas-roles.md, and src/db/audit-log.ts for the
@@ -99,6 +105,13 @@ export const WEBHOOK_DELIVERY_MAX_ATTEMPTS = 5;
 
 export const RUN_STATUSES = ['queued', 'running', 'succeeded', 'failed', 'cancelled'] as const;
 export type RunStatus = (typeof RUN_STATUSES)[number];
+
+/**
+ * Scoped to `requirementsAnalyses`, not the intake item itself: the intake
+ * state machine in src/intake/state.ts is unrelated and unchanged by this.
+ */
+export const REQUIREMENTS_ANALYSIS_STATUSES = ['pending', 'completed', 'failed'] as const;
+export type RequirementsAnalysisStatus = (typeof REQUIREMENTS_ANALYSIS_STATUSES)[number];
 
 export const CHECKPOINT_STATUSES = [
   /** Executing, or the worker died mid-step. Resume re-runs it. */
@@ -218,6 +231,13 @@ export const INDEXES: Readonly<Record<CollectionName, readonly IndexDefinition[]
   [COLLECTIONS.auditLog]: [
     { name: 'occurredAt_desc', key: { occurredAt: -1 } },
     { name: 'subject_occurredAt', key: { subjectType: 1, subjectId: 1, occurredAt: -1 } },
+  ],
+  [COLLECTIONS.requirementsAnalyses]: [
+    // The retry/duplicate guard: one analysis row per intake item, updated in
+    // place on retry rather than appended to.
+    { name: 'intakeItemId_unique', key: { intakeItemId: 1 }, options: { unique: true } },
+    { name: 'issueKey_createdAt', key: { issueKey: 1, createdAt: -1 } },
+    { name: 'status_updatedAt', key: { status: 1, updatedAt: 1 } },
   ],
 };
 
@@ -452,6 +472,52 @@ export const OUTBOUND_WRITE_VALIDATOR: Document = {
 /** Default retry ceiling for an outbound write before it is abandoned. */
 export const OUTBOUND_WRITE_MAX_ATTEMPTS = 5;
 
+/**
+ * Validator for requirements analyses.
+ *
+ * `inputHash` is what makes a `completed` row safe to reuse: it is only
+ * skipped on a retry when the intake snapshot's hash still matches, the same
+ * parity `checkpoints.inputHash` gives run resume. `result` and `error` are
+ * freeform objects rather than fully specified here, matching how `detail` is
+ * handled on `auditLog` — the shape is owned by src/requirements/analyzer.ts.
+ */
+export const REQUIREMENTS_ANALYSIS_VALIDATOR: Document = {
+  $jsonSchema: {
+    bsonType: 'object',
+    required: [
+      'intakeItemId',
+      'issueKey',
+      'status',
+      'inputHash',
+      'attempts',
+      'agentVersion',
+      'createdAt',
+      'updatedAt',
+    ],
+    additionalProperties: true,
+    properties: {
+      intakeItemId: { bsonType: 'objectId' },
+      // Format belongs to Neutara, so this stays a string rather than an id;
+      // denormalized from intakeItems for convenient lookup and logging.
+      issueKey: { bsonType: 'string', minLength: 1 },
+      status: { enum: [...REQUIREMENTS_ANALYSIS_STATUSES] },
+      inputHash: { bsonType: 'string', minLength: 1 },
+      result: { bsonType: ['object', 'null'] },
+      error: { bsonType: ['object', 'null'] },
+      attempts: { bsonType: 'int', minimum: 0 },
+      // Which analyzer produced (or attempted) the result. 'stub-v1' for now;
+      // a real LLM-backed agent is a version bump, not a schema change.
+      agentVersion: { bsonType: 'string', minLength: 1 },
+      // Set only for an LLM-backed run, via recordUsage() — independent of
+      // `result`, which stays exactly the RequirementsResult shape.
+      usage: { bsonType: ['object', 'null'] },
+      createdAt: { bsonType: 'date' },
+      updatedAt: { bsonType: 'date' },
+      completedAt: { bsonType: ['date', 'null'] },
+    },
+  },
+};
+
 /** Collections created with options, rather than implicitly on first write. */
 export const COLLECTION_OPTIONS: Partial<Record<CollectionName, Document>> = {
   [COLLECTIONS.webhookDeliveries]: {
@@ -471,6 +537,11 @@ export const COLLECTION_OPTIONS: Partial<Record<CollectionName, Document>> = {
   },
   [COLLECTIONS.outboundWrites]: {
     validator: OUTBOUND_WRITE_VALIDATOR,
+    validationLevel: 'strict',
+    validationAction: 'error',
+  },
+  [COLLECTIONS.requirementsAnalyses]: {
+    validator: REQUIREMENTS_ANALYSIS_VALIDATOR,
     validationLevel: 'strict',
     validationAction: 'error',
   },

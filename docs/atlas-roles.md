@@ -164,20 +164,60 @@ To inspect the live grants:
 db.getSiblingDB("admin").runCommand({ connectionStatus: 1, showPrivileges: true });
 ```
 
-## Test database and roles — NOT YET PROVISIONED
+## Test database and roles
 
 Integration tests refuse to run against the production database. They require
 `AISDLC_TEST_DATABASE`, set explicitly to something other than `aisdlc`, and
 skip otherwise — there is no fallback, because the failure mode of one here is
 silent writes to live data.
 
-**This is not yet provisioned.** Both existing roles are scoped to
-`{ db: "aisdlc" }`, so a different database is invisible to them. Pointing the
-suite at the test database today fails with:
+The **running service** has the same shape of guarantee, added later and
+separately: outside production, `src/config/env.ts`'s `resolveRuntimeMongoUri`
+requires `AISDLC_TEST_MONGODB_URI` and refuses to start if it would
+authenticate as the same identity as `AISDLC_MONGODB_URI` (`aisdlc_app`) —
+whether byte-identical or merely sharing a username. Before this existed, the
+service always authenticated as `aisdlc_app` regardless of which database
+`AISDLC_DATABASE_NAME` pointed it at, which is exactly what produced:
 
 ```
-user is not allowed to do action [listCollections] on [aisdlc_test.]
+user is not allowed to do action [find] on [aisdlc_test.webhookDeliveries]
+user is not allowed to do action [insert] on [aisdlc_test.webhookDeliveries]
 ```
+
+during a local end-to-end test — `aisdlc_app`'s role grants nothing on
+`aisdlc_test`, by design (see above), and there was no code path for the
+service to use a different credential.
+
+**Current provisioning status, as verified against the live cluster in this
+project so far:**
+
+- `aisdlcTestMigratorRole` / the test migrator user — **confirmed live**.
+  `npm run db:init:test` has successfully created collections, validators and
+  indexes in `aisdlc_test` using it.
+- `aisdlcTestAppRole` / the dedicated test application user (`aisdlc-test-app`)
+  — **confirmed live for `intakeItems`, `webhookDeliveries` and `auditLog`.**
+  A full local webhook-ingestion-to-enrichment run succeeded end to end
+  through this identity: `find`/`insert`/`update` on `webhookDeliveries`,
+  `find`/`insert` on `intakeItems`, and the audit-log appends all worked.
+- **`requirementsAnalyses` — confirmed MISSING**, not merely unconfirmed.
+  `npm run requirements:run` against this identity fails with:
+
+  ```
+  user is not allowed to do action [find] on [aisdlc_test.requirementsAnalyses]
+  ```
+
+  `requirementsAnalyses` is a collection added after `aisdlcTestAppRole` was
+  first drafted (for the Requirements Agent). Collection grants in this
+  project are enumerated explicitly per collection (see "What each
+  deliberately lacks" above), so a role never automatically gains access to a
+  collection created after it was defined — this needs the privilege block
+  below added to the LIVE role in the Atlas console; it is already correct in
+  this document, just not yet applied to the cluster. The equivalent gap
+  exists on production `aisdlcAppRole` too (unrelated to test), noted
+  separately above.
+
+If any of the above turns out not to be provisioned, create the role as
+drafted below.
 
 The test database is **`aisdlc_test`**. Create two roles and two users,
 mirroring the production pair but scoped to it. In Atlas: **Database Access →
@@ -201,6 +241,8 @@ Database User** with the matching custom role.
     { resource: { db: "aisdlc_test", collection: "outboundWrites" },
       actions: ["find", "insert", "update", "remove"] },
     { resource: { db: "aisdlc_test", collection: "webhookDeliveries" },
+      actions: ["find", "insert", "update", "remove"] },
+    { resource: { db: "aisdlc_test", collection: "requirementsAnalyses" },
       actions: ["find", "insert", "update", "remove"] },
     { resource: { db: "aisdlc_test", collection: "auditLog" },
       actions: ["find", "insert"] },
