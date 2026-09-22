@@ -36,6 +36,10 @@ const SECRET_VALUE_PATTERNS: readonly RegExp[] = [
   /\bsk-proj-[A-Za-z0-9_-]{8,}/g, // OpenAI project-scoped API key
   /\bnta_[A-Za-z0-9_-]{8,}/g, // Neutara personal API token
   /\bAKIA[0-9A-Z]{16}\b/g, // AWS access key id
+  /\bgh[a-z]_[A-Za-z0-9]{20,}\b/g, // GitHub App/personal token (ghs_, ghp_, gho_, ghu_, ghr_)
+  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, // GitHub fine-grained personal access token
+  /-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/g, // PEM private key block (GitHub App signing key)
+  /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, // JWT (App-level auth token)
 ];
 
 /** Strips credentials from a URI but keeps host and database, which are useful. */

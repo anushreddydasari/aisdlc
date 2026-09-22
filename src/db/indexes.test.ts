@@ -290,7 +290,10 @@ describe('initializeDatabase', () => {
       'checkpoints',
       'intakeItems',
       'outboundWrites',
+      'repositoryRegistry',
+      'repositorySelections',
       'requirementsAnalyses',
+      'runs',
       'webhookDeliveries',
     ]);
   });
@@ -305,7 +308,10 @@ describe('initializeDatabase', () => {
       'checkpoints',
       'outboundWrites',
       'intakeItems',
+      'repositoryRegistry',
+      'repositorySelections',
       'requirementsAnalyses',
+      'runs',
       'webhookDeliveries',
     ]) {
       assert.ok(recorded.created.includes(name));

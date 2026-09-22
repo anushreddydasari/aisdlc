@@ -32,6 +32,21 @@ export const COLLECTIONS = {
    */
   requirementsAnalyses: 'requirementsAnalyses',
   /**
+   * Authorized mappings from a Neutara project (spaceKey) to a GitHub
+   * repository. The sole source of truth for which repositories a run may
+   * ever be pointed at — never a ticket-supplied URL. Managed by operators,
+   * not written to by any pipeline code.
+   */
+  repositoryRegistry: 'repositoryRegistry',
+  /**
+   * One row per run: the outcome of matching its intake item's project
+   * against `repositoryRegistry`, and the human-confirmed result once
+   * chosen. Deliberately separate from `runs` and `intakeItems` — neither
+   * gets a repository-selection status of its own, the same reason
+   * `requirementsAnalyses` was kept separate from `intakeItems`.
+   */
+  repositorySelections: 'repositorySelections',
+  /**
    * Append-only record of every state change. Enforced by the database:
    * aisdlcAppRole grants `find` and `insert` on this collection and nothing
    * else. See docs/atlas-roles.md, and src/db/audit-log.ts for the
@@ -107,11 +122,35 @@ export const RUN_STATUSES = ['queued', 'running', 'succeeded', 'failed', 'cancel
 export type RunStatus = (typeof RUN_STATUSES)[number];
 
 /**
+ * What caused a run to be queued. Only 'approval' exists for this phase (the
+ * orchestrator queues a run the moment an intake item is approved); a future
+ * manual-retry path would add its own value here rather than overload this
+ * one, since the two need different duplicate-prevention rules (see
+ * INDEXES[runs] below).
+ */
+export const RUN_TRIGGERS = ['approval'] as const;
+export type RunTrigger = (typeof RUN_TRIGGERS)[number];
+
+/**
  * Scoped to `requirementsAnalyses`, not the intake item itself: the intake
  * state machine in src/intake/state.ts is unrelated and unchanged by this.
  */
 export const REQUIREMENTS_ANALYSIS_STATUSES = ['pending', 'completed', 'failed'] as const;
 export type RequirementsAnalysisStatus = (typeof REQUIREMENTS_ANALYSIS_STATUSES)[number];
+
+/** A mapping is either usable for selection or not. There is no "pending" state — an entry is authored complete. */
+export const REPOSITORY_REGISTRY_STATUSES = ['active', 'inactive'] as const;
+export type RepositoryRegistryStatus = (typeof REPOSITORY_REGISTRY_STATUSES)[number];
+
+/**
+ * Scoped to `repositorySelections`, independent of both `runs.status` and
+ * `intakeItems.status` — the same separation `requirementsAnalyses` already
+ * established. `pending` covers "exactly one candidate, awaiting the human
+ * confirmation decision #2 always requires" — even an unambiguous match is
+ * never auto-selected.
+ */
+export const REPOSITORY_SELECTION_STATUSES = ['pending', 'selected', 'failed', 'ambiguous'] as const;
+export type RepositorySelectionStatus = (typeof REPOSITORY_SELECTION_STATUSES)[number];
 
 export const CHECKPOINT_STATUSES = [
   /** Executing, or the worker died mid-step. Resume re-runs it. */
@@ -155,6 +194,8 @@ export const AUDIT_SUBJECT_TYPES = [
   'checkpoint',
   'outboundWrite',
   'webhookDelivery',
+  'repositoryRegistryEntry',
+  'repositorySelection',
 ] as const;
 export type AuditSubjectType = (typeof AUDIT_SUBJECT_TYPES)[number];
 
@@ -204,6 +245,13 @@ export const INDEXES: Readonly<Record<CollectionName, readonly IndexDefinition[]
     { name: 'createdAt_desc', key: { createdAt: -1 } },
   ],
   [COLLECTIONS.runs]: [
+    // The idempotency guard for this phase: the orchestrator queues at most
+    // one run per approved intake item. This makes intakeItemId_startedAt
+    // below temporarily redundant (there can only ever be one row per
+    // intakeItemId), kept anyway because a future retry/re-run path will
+    // need to relax this to a compound key (e.g. {intakeItemId, trigger}),
+    // at which point run-history-by-intake-item becomes meaningful again.
+    { name: 'intakeItemId_unique', key: { intakeItemId: 1 }, options: { unique: true } },
     { name: 'intakeItemId_startedAt', key: { intakeItemId: 1, startedAt: -1 } },
     { name: 'status_startedAt', key: { status: 1, startedAt: -1 } },
   ],
@@ -238,6 +286,33 @@ export const INDEXES: Readonly<Record<CollectionName, readonly IndexDefinition[]
     { name: 'intakeItemId_unique', key: { intakeItemId: 1 }, options: { unique: true } },
     { name: 'issueKey_createdAt', key: { issueKey: 1, createdAt: -1 } },
     { name: 'status_updatedAt', key: { status: 1, updatedAt: 1 } },
+  ],
+  [COLLECTIONS.repositoryRegistry]: [
+    // "Prevent duplicate active mappings that would cause ambiguous
+    // selection" (requirement 13) means the SAME repository must not be
+    // registered twice as active for the SAME project — not that only one
+    // repository may ever be active per project, which is exactly the
+    // legitimate "multiple matches -> ambiguous" case decision #6 requires
+    // supporting. A partial unique index expresses precisely that: unique
+    // among active documents only, so a deactivated-then-recreated entry,
+    // or two genuinely different repositories active for one project, are
+    // both still allowed.
+    {
+      name: 'projectIdentifier_repositoryId_active_unique',
+      key: { projectIdentifier: 1, repositoryId: 1 },
+      options: { unique: true, partialFilterExpression: { status: 'active' } },
+    },
+    // The lookup this whole feature exists to serve: "active mappings for
+    // this project" (Phase 3 requirement 6).
+    { name: 'projectIdentifier_status', key: { projectIdentifier: 1, status: 1 } },
+  ],
+  [COLLECTIONS.repositorySelections]: [
+    // Requirement: "each run may select only one repository" / "prevent
+    // duplicate selection records" — one selection row per run, ever.
+    { name: 'runId_unique', key: { runId: 1 }, options: { unique: true } },
+    // The retry worker's poll query: unresolved selections due for
+    // re-evaluation. Mirrors webhookDeliveries.status_nextAttemptAt exactly.
+    { name: 'status_nextAttemptAt', key: { status: 1, nextAttemptAt: 1 } },
   ],
 };
 
@@ -518,6 +593,137 @@ export const REQUIREMENTS_ANALYSIS_VALIDATOR: Document = {
   },
 };
 
+/**
+ * Validator for pipeline runs.
+ *
+ * This phase only ever creates a run in `queued` status, via the
+ * orchestrator — see src/orchestrator/repository.ts. `startedAt` and
+ * `completedAt` exist now so the shape is stable for a future Coding Agent
+ * to fill in, the same way intakeItems.approvedBy existed before Phase 6
+ * populated it.
+ */
+export const RUN_VALIDATOR: Document = {
+  $jsonSchema: {
+    bsonType: 'object',
+    required: ['intakeItemId', 'issueKey', 'status', 'trigger', 'createdAt', 'updatedAt'],
+    additionalProperties: true,
+    properties: {
+      intakeItemId: { bsonType: 'objectId' },
+      // Format belongs to Neutara, so this stays a string; denormalized from
+      // intakeItems for convenient lookup and logging, same as elsewhere.
+      issueKey: { bsonType: 'string', minLength: 1 },
+      status: { enum: [...RUN_STATUSES] },
+      trigger: { enum: [...RUN_TRIGGERS] },
+      createdAt: { bsonType: 'date' },
+      startedAt: { bsonType: ['date', 'null'] },
+      completedAt: { bsonType: ['date', 'null'] },
+      updatedAt: { bsonType: 'date' },
+    },
+  },
+};
+
+/**
+ * Validator for the repository registry.
+ *
+ * `repositoryUrl` here is validated for SHAPE only (a well-formed GitHub
+ * URL) — that is not authorization. Authorization is "this URL came from a
+ * document in this collection at all"; nothing in the rest of the system
+ * ever accepts a repository URL from anywhere else. `accessPolicy` is
+ * deliberately untyped beyond object/null: it may only ever hold non-secret
+ * GitHub App metadata (e.g. an installation id), never a credential or
+ * private key — enforced by convention and code review, not by this
+ * validator, since the concrete shape isn't decided yet (GitHub App
+ * integration is future work).
+ */
+export const REPOSITORY_REGISTRY_VALIDATOR: Document = {
+  $jsonSchema: {
+    bsonType: 'object',
+    required: [
+      'projectIdentifier',
+      'repositoryId',
+      'repositoryUrl',
+      'defaultBranch',
+      'allowedBranches',
+      'status',
+      'createdAt',
+      'updatedAt',
+      'createdBy',
+      'updatedBy',
+    ],
+    additionalProperties: true,
+    properties: {
+      // Neutara's spaceKey. A lookup key only, never itself a source of
+      // authorization.
+      projectIdentifier: { bsonType: 'string', minLength: 1 },
+      repositoryId: { bsonType: 'string', minLength: 1 },
+      repositoryUrl: { bsonType: 'string', minLength: 1 },
+      defaultBranch: { bsonType: 'string', minLength: 1 },
+      allowedBranches: {
+        bsonType: 'array',
+        minItems: 1,
+        items: { bsonType: 'string', minLength: 1 },
+      },
+      status: { enum: [...REPOSITORY_REGISTRY_STATUSES] },
+      // Non-secret GitHub App metadata only — see the module comment above.
+      accessPolicy: { bsonType: ['object', 'null'] },
+      createdAt: { bsonType: 'date' },
+      updatedAt: { bsonType: 'date' },
+      createdBy: { bsonType: 'string', minLength: 1 },
+      updatedBy: { bsonType: 'string', minLength: 1 },
+    },
+  },
+};
+
+/**
+ * Validator for repository selections.
+ *
+ * `selected*` fields are a SNAPSHOT taken at confirmation time (requirement:
+ * "future registry changes do not alter the stored selection snapshot") —
+ * they are never re-read from `repositoryRegistry` after that point, so
+ * they are typed independently of it here rather than by reference.
+ */
+export const REPOSITORY_SELECTION_VALIDATOR: Document = {
+  $jsonSchema: {
+    bsonType: 'object',
+    required: [
+      'runId',
+      'intakeItemId',
+      'issueKey',
+      'projectIdentifier',
+      'candidateRepositoryIds',
+      'status',
+      'attempts',
+      'nextAttemptAt',
+      'createdAt',
+      'updatedAt',
+    ],
+    additionalProperties: true,
+    properties: {
+      runId: { bsonType: 'objectId' },
+      intakeItemId: { bsonType: 'objectId' },
+      issueKey: { bsonType: 'string', minLength: 1 },
+      projectIdentifier: { bsonType: 'string', minLength: 1 },
+      candidateRepositoryIds: { bsonType: 'array', items: { bsonType: 'string', minLength: 1 } },
+      selectedRepositoryId: { bsonType: ['string', 'null'] },
+      selectedRepositoryUrl: { bsonType: ['string', 'null'] },
+      selectedDefaultBranch: { bsonType: ['string', 'null'] },
+      selectedAllowedBranches: { bsonType: ['array', 'null'], items: { bsonType: 'string' } },
+      selectedAccessPolicy: { bsonType: ['object', 'null'] },
+      status: { enum: [...REPOSITORY_SELECTION_STATUSES] },
+      failureReason: { bsonType: ['string', 'null'] },
+      attempts: { bsonType: 'int', minimum: 0 },
+      nextAttemptAt: { bsonType: 'date' },
+      confirmedBy: { bsonType: ['string', 'null'] },
+      confirmedAt: { bsonType: ['date', 'null'] },
+      // Set once, alongside a transition INTO failed/ambiguous, so a
+      // repeated retry that lands on the same outcome does not re-notify.
+      lastNotifiedStatus: { bsonType: ['string', 'null'] },
+      createdAt: { bsonType: 'date' },
+      updatedAt: { bsonType: 'date' },
+    },
+  },
+};
+
 /** Collections created with options, rather than implicitly on first write. */
 export const COLLECTION_OPTIONS: Partial<Record<CollectionName, Document>> = {
   [COLLECTIONS.webhookDeliveries]: {
@@ -542,6 +748,21 @@ export const COLLECTION_OPTIONS: Partial<Record<CollectionName, Document>> = {
   },
   [COLLECTIONS.requirementsAnalyses]: {
     validator: REQUIREMENTS_ANALYSIS_VALIDATOR,
+    validationLevel: 'strict',
+    validationAction: 'error',
+  },
+  [COLLECTIONS.runs]: {
+    validator: RUN_VALIDATOR,
+    validationLevel: 'strict',
+    validationAction: 'error',
+  },
+  [COLLECTIONS.repositoryRegistry]: {
+    validator: REPOSITORY_REGISTRY_VALIDATOR,
+    validationLevel: 'strict',
+    validationAction: 'error',
+  },
+  [COLLECTIONS.repositorySelections]: {
+    validator: REPOSITORY_SELECTION_VALIDATOR,
     validationLevel: 'strict',
     validationAction: 'error',
   },

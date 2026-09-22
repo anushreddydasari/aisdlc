@@ -7,7 +7,7 @@
  *
  *   production code  AISDLC_MONGODB_URI, AISDLC_MONGODB_MIGRATION_URI
  *   integration tests AISDLC_TEST_MONGODB_URI, AISDLC_TEST_MONGODB_MIGRATION_URI,
- *                     AISDLC_TEST_DATABASE
+ *                     AISDLC_TEST_DATABASE, AISDLC_TEST_CLEANUP_MONGODB_URI (optional)
  *
  * Nothing here reads a production variable, and there is no fallback to one.
  * A test run therefore cannot authenticate as `aisdlc_app` or
@@ -22,6 +22,16 @@
 export const TEST_APP_URI_VARIABLE = 'AISDLC_TEST_MONGODB_URI';
 export const TEST_MIGRATION_URI_VARIABLE = 'AISDLC_TEST_MONGODB_MIGRATION_URI';
 export const TEST_DATABASE_VARIABLE = 'AISDLC_TEST_DATABASE';
+/**
+ * Optional. A THIRD, narrower identity: `remove` only, only on the specific
+ * test collections an integration test namespaces its own rows in — never
+ * `auditLog`. Absent by default; nothing requires it. See
+ * "Optional: a dedicated test-cleanup credential" in docs/atlas-roles.md.
+ * When unset, integration tests fall back to best-effort cleanup with the
+ * application credential and report what could not be removed, rather than
+ * failing.
+ */
+export const TEST_CLEANUP_URI_VARIABLE = 'AISDLC_TEST_CLEANUP_MONGODB_URI';
 
 /** Variables the integration suite must never read. Asserted by its tests. */
 export const PRODUCTION_URI_VARIABLES = [
@@ -33,6 +43,8 @@ export interface IntegrationConfig {
   readonly appUri: string;
   readonly migrationUri: string;
   readonly databaseName: string;
+  /** Undefined unless AISDLC_TEST_CLEANUP_MONGODB_URI is set — see its constant above. */
+  readonly cleanupUri: string | undefined;
 }
 
 export type IntegrationConfigResult =
@@ -61,6 +73,8 @@ export function resolveIntegrationConfig(
   const appUri = present(source, TEST_APP_URI_VARIABLE);
   const migrationUri = present(source, TEST_MIGRATION_URI_VARIABLE);
   const databaseName = present(source, TEST_DATABASE_VARIABLE);
+  // Optional: never added to `missing` below, so its absence never blocks the suite.
+  const cleanupUri = present(source, TEST_CLEANUP_URI_VARIABLE);
 
   const missing = [
     appUri === undefined ? TEST_APP_URI_VARIABLE : null,
@@ -93,6 +107,6 @@ export function resolveIntegrationConfig(
 
   return {
     ok: true,
-    config: { appUri: appUri!, migrationUri: migrationUri!, databaseName: databaseName! },
+    config: { appUri: appUri!, migrationUri: migrationUri!, databaseName: databaseName!, cleanupUri },
   };
 }

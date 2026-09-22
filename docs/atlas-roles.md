@@ -215,6 +215,49 @@ project so far:**
   this document, just not yet applied to the cluster. The equivalent gap
   exists on production `aisdlcAppRole` too (unrelated to test), noted
   separately above.
+- **`runs` (orchestrator) — status unknown, not yet exercised against the
+  live cluster.** Unlike `requirementsAnalyses`, `runs` was already present
+  in this draft from the original Phase 0 scaffolding (before
+  `requirementsAnalyses` existed), so it may already be granted on the live
+  role — but nothing has actually read or written it yet to confirm either
+  way. Running the orchestrator locally for the first time (`npm run dev`
+  against `aisdlc_test` with an approved intake item present) will settle
+  it: if the grant is missing, expect the same `user is not allowed to do
+  action [...] on [aisdlc_test.runs]` shape of error, surfaced in the
+  service log as `"orchestrator pass failed"` rather than crashing the
+  process (the loop swallows a failing pass and retries next tick — see
+  src/orchestrator/scheduler.ts).
+- **`repositoryRegistry` and `repositorySelections` — granted and confirmed
+  live, `remove` deliberately excluded.** Originally confirmed MISSING
+  entirely (`npm run dev` against `aisdlc_test` failed with `user is not
+  allowed to do action [find] on [aisdlc_test.repositorySelections]`,
+  surfaced as `"repository selection matching pass failed"` rather than
+  crashing the process). `aisdlcTestAppRole` has since been updated. A
+  `connectionStatus`/`showPrivileges` probe against the live cluster with the
+  `aisdlc-test-app` credential shows
+
+  ```
+  aisdlc_test.repositoryRegistry     find insert update
+  aisdlc_test.repositorySelections   find insert update
+  ```
+
+  `npm run test:integration` confirms this is exactly right for the
+  application's needs: registry creation, lookup, duplicate-mapping
+  rejection, selection matching, human confirmation, and audit-log queries
+  all pass end to end against the live cluster, and the draft below has been
+  updated to match this live grant (no `remove`, unlike every other data
+  collection in the draft). **`remove` is intentionally not granted here** —
+  nothing in the application ever deletes a `repositoryRegistry` or
+  `repositorySelections` document (deactivation is a status flip, not a
+  delete), so there is no product reason to widen this credential, and doing
+  so "to make test cleanup easier" is exactly the shortcut this project's
+  least-privilege discipline exists to refuse. Test-only cleanup instead uses
+  either a separate, narrower, delete-only credential (see "Optional: a
+  dedicated test-cleanup credential" below) or reports its own leftover rows
+  without deleting them — see the header comment in
+  `src/repository-selection/workflow.integration.test.ts`. The same
+  narrower-than-usual grant is worth applying to production `aisdlcAppRole`
+  too, once it adds these two collections to "The live grants" above.
 
 If any of the above turns out not to be provisioned, create the role as
 drafted below.
@@ -244,6 +287,10 @@ Database User** with the matching custom role.
       actions: ["find", "insert", "update", "remove"] },
     { resource: { db: "aisdlc_test", collection: "requirementsAnalyses" },
       actions: ["find", "insert", "update", "remove"] },
+    { resource: { db: "aisdlc_test", collection: "repositoryRegistry" },
+      actions: ["find", "insert", "update"] },
+    { resource: { db: "aisdlc_test", collection: "repositorySelections" },
+      actions: ["find", "insert", "update"] },
     { resource: { db: "aisdlc_test", collection: "auditLog" },
       actions: ["find", "insert"] },
     { resource: { db: "aisdlc_test", collection: "" },
@@ -276,12 +323,68 @@ AISDLC_TEST_MONGODB_URI=<test app user>
 AISDLC_TEST_MONGODB_MIGRATION_URI=<test migration user>
 ```
 
-The integration suite reads only these three. It reads no production
-variable, and there is no fallback to one — so a test run cannot
-authenticate as `aisdlc_app` or `aisdlc_migrator` even when those credentials
-are loaded in the same environment. `src/intake/integration-config.ts` is the
-single place that resolves them, and offline tests assert statically that no
-production variable is referenced there or in the test file.
+The integration suite reads only these three, plus one optional fourth
+variable described next. It reads no production variable, and there is no
+fallback to one — so a test run cannot authenticate as `aisdlc_app` or
+`aisdlc_migrator` even when those credentials are loaded in the same
+environment. `src/intake/integration-config.ts` is the single place that
+resolves all of them, and offline tests in `src/intake/integration-config.test.ts`
+assert statically that no production variable is referenced there or in
+either integration test file.
+
+### Optional: a dedicated test-cleanup credential
+
+`repositoryRegistry` and `repositorySelections` deliberately do not grant
+`remove` to `aisdlcTestAppRole` — see above. That means
+`src/repository-selection/workflow.integration.test.ts` cannot delete its own
+`ITEST-`-namespaced rows using the application credential. By default it
+doesn't try to widen that credential; it reports the leftover rows instead
+(by collection and count, in its `after()` hook) and moves on. Every row is
+namespaced with a fresh run id, so this is a data-hygiene inconvenience, not
+a correctness problem — a later run never collides with what an earlier one
+left behind.
+
+If you want the suite to fully clean up after itself, provision a THIRD,
+narrower identity — `remove` only, only on the four collections this suite
+writes test rows into, and **never `auditLog`**:
+
+```js
+// aisdlcTestCleanupRole — remove-only, and only on the collections
+// src/repository-selection/workflow.integration.test.ts writes test rows
+// into. Deliberately excludes auditLog: that collection has no cleanup
+// path, by design, for any credential.
+{
+  role: "aisdlcTestCleanupRole",
+  privileges: [
+    { resource: { db: "aisdlc_test", collection: "repositoryRegistry" },
+      actions: ["remove"] },
+    { resource: { db: "aisdlc_test", collection: "repositorySelections" },
+      actions: ["remove"] },
+    { resource: { db: "aisdlc_test", collection: "runs" },
+      actions: ["remove"] },
+    { resource: { db: "aisdlc_test", collection: "intakeItems" },
+      actions: ["remove"] }
+  ],
+  roles: []
+}
+```
+
+This role cannot `find`, so a user holding only it cannot read data, only
+delete documents it is separately told to target — the test still uses the
+application credential's `find` to decide and report what remains. Create a
+matching database user (e.g. `aisdlc-test-cleanup`) and add:
+
+```
+AISDLC_TEST_CLEANUP_MONGODB_URI=<test cleanup user>
+```
+
+This variable is **entirely optional**. Its absence never blocks the suite —
+`resolveIntegrationConfig` treats it exactly like a missing optional field,
+never like a missing required one. When present, `workflow.integration.test.ts`
+opens a third connection with it in `before()`, verifies (the same way as
+every other connection in this file) that it did not somehow resolve to the
+production database, and uses it in `after()` instead of the application
+credential.
 
 Two deliberate differences from production:
 

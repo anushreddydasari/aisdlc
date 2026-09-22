@@ -21,6 +21,14 @@ import { createWebhookDeliveryRepository } from './db/webhook-deliveries.ts';
 import { createIntakeRepository } from './intake/repository.ts';
 import { createNeutaraClient } from './neutara/client.ts';
 import { startEnrichmentLoop, type EnrichmentLoop } from './enrichment/scheduler.ts';
+import { createRunsRepository } from './orchestrator/repository.ts';
+import { startOrchestratorLoop, type OrchestratorLoop } from './orchestrator/scheduler.ts';
+import { createRepositoryRegistryRepository } from './repository-registry/repository.ts';
+import { createRepositorySelectionRepository } from './repository-selection/repository.ts';
+import {
+  startRepositorySelectionLoop,
+  type RepositorySelectionLoop,
+} from './repository-selection/scheduler.ts';
 import { createLogger } from './logging/logger.ts';
 import { createHttpServer } from './api/server.ts';
 
@@ -129,6 +137,26 @@ async function main(): Promise<void> {
         return db ? createIntakeRepository(db, createAuditLog(db, logger), logger) : undefined;
       },
     },
+    repositoryRegistry: {
+      logger,
+      operatorToken,
+      get registry() {
+        const db = mongo.db();
+        return db ? createRepositoryRegistryRepository(db, createAuditLog(db, logger), logger) : undefined;
+      },
+    },
+    repositorySelection: {
+      logger,
+      operatorToken,
+      get selections() {
+        const db = mongo.db();
+        return db ? createRepositorySelectionRepository(db, createAuditLog(db, logger), logger) : undefined;
+      },
+      get registry() {
+        const db = mongo.db();
+        return db ? createRepositoryRegistryRepository(db, createAuditLog(db, logger), logger) : undefined;
+      },
+    },
   });
 
   // Phase 4: drain pending deliveries into intake items. Started only when
@@ -161,6 +189,54 @@ async function main(): Promise<void> {
     );
   }
 
+  // Queues a run for every approved intake item. Unlike enrichment, this has
+  // no external dependency to gate on — only the database, already covered
+  // by isReady — so it always starts, never conditionally.
+  const orchestrator: OrchestratorLoop = startOrchestratorLoop(
+    {
+      get intake() {
+        const db = mongo.db()!;
+        return createIntakeRepository(db, createAuditLog(db, logger), logger);
+      },
+      get runs() {
+        return createRunsRepository(mongo.db()!, logger);
+      },
+      get audit() {
+        return createAuditLog(mongo.db()!, logger);
+      },
+      logger,
+    },
+    { isReady: () => mongo.db() !== undefined },
+  );
+
+  // Matches every queued run to a repositoryRegistry entry (or notes why it
+  // could not). Like the orchestrator, this only depends on the database, so
+  // it always starts, never conditionally.
+  const repositorySelection: RepositorySelectionLoop = startRepositorySelectionLoop(
+    {
+      get intake() {
+        const db = mongo.db()!;
+        return createIntakeRepository(db, createAuditLog(db, logger), logger);
+      },
+      get runs() {
+        return createRunsRepository(mongo.db()!, logger);
+      },
+      get registry() {
+        const db = mongo.db()!;
+        return createRepositoryRegistryRepository(db, createAuditLog(db, logger), logger);
+      },
+      get selections() {
+        const db = mongo.db()!;
+        return createRepositorySelectionRepository(db, createAuditLog(db, logger), logger);
+      },
+      get audit() {
+        return createAuditLog(mongo.db()!, logger);
+      },
+      logger,
+    },
+    { isReady: () => mongo.db() !== undefined },
+  );
+
   server.listen(config.port, () => {
     logger.info('http server listening', { port: config.port });
   });
@@ -170,6 +246,8 @@ async function main(): Promise<void> {
     // Stopped before the connection closes, so an in-flight pass is not left
     // reaching for a client that is going away.
     enrichment?.stop();
+    orchestrator.stop();
+    repositorySelection.stop();
     server.close(() => {
       void (async () => {
         await mongo.close();

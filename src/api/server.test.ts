@@ -269,6 +269,166 @@ describe('/intake approval routing', () => {
   });
 });
 
+describe('/repository-registry routing', () => {
+  async function withRegistry(mounted: boolean): Promise<{ url: string }> {
+    const deps: ServerDeps = {
+      logger: createLogger({ write: () => {} }),
+      health: { version: '0.1.0', uptimeSeconds: () => 1, database: undefined },
+      ...(mounted
+        ? {
+            repositoryRegistry: {
+              logger: createLogger({ write: () => {} }),
+              operatorToken: undefined,
+              registry: undefined,
+            },
+          }
+        : {}),
+    };
+    const server = createHttpServer(deps);
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address() as AddressInfo;
+    return { url: `http://127.0.0.1:${port}` };
+  }
+
+  it('routes POST /repository-registry to the create handler', async () => {
+    const { url } = await withRegistry(true);
+    const res = await fetch(`${url}/repository-registry`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    // No operator token configured, so the handler answers 401 — which
+    // proves the request reached it rather than the 405 or 404 paths.
+    assert.equal(res.status, 401);
+  });
+
+  it('routes GET /repository-registry to the list handler', async () => {
+    const { url } = await withRegistry(true);
+    const res = await fetch(`${url}/repository-registry`);
+    assert.equal(res.status, 401);
+  });
+
+  it('routes GET /repository-registry/:id to the get handler', async () => {
+    const { url } = await withRegistry(true);
+    const res = await fetch(`${url}/repository-registry/abc123`);
+    assert.equal(res.status, 401);
+  });
+
+  it('routes PATCH /repository-registry/:id to the update handler', async () => {
+    const { url } = await withRegistry(true);
+    const res = await fetch(`${url}/repository-registry/abc123`, { method: 'PATCH', body: '{}' });
+    assert.equal(res.status, 401);
+  });
+
+  it('routes POST /repository-registry/:id/deactivate to the status handler', async () => {
+    const { url } = await withRegistry(true);
+    const res = await fetch(`${url}/repository-registry/abc123/deactivate`, { method: 'POST', body: '{}' });
+    assert.equal(res.status, 401);
+  });
+
+  it('routes POST /repository-registry/:id/reactivate to the status handler', async () => {
+    const { url } = await withRegistry(true);
+    const res = await fetch(`${url}/repository-registry/abc123/reactivate`, { method: 'POST', body: '{}' });
+    assert.equal(res.status, 401);
+  });
+
+  it('returns 404 for every registry route when not mounted', async () => {
+    const { url } = await withRegistry(false);
+    for (const [path, method] of [
+      ['/repository-registry', 'GET'],
+      ['/repository-registry', 'POST'],
+      ['/repository-registry/abc123', 'GET'],
+      ['/repository-registry/abc123', 'PATCH'],
+      ['/repository-registry/abc123/deactivate', 'POST'],
+    ] as const) {
+      const res = await fetch(`${url}${path}`, { method });
+      assert.equal(res.status, 404, `${method} ${path} was not 404`);
+    }
+  });
+
+  it('refuses DELETE on the collection route', async () => {
+    const { url } = await withRegistry(true);
+    const res = await fetch(`${url}/repository-registry`, { method: 'DELETE' });
+    assert.equal(res.status, 405);
+  });
+
+  it('refuses an unmatched action segment on an item route', async () => {
+    // Falls through to the generic "POST anywhere unmatched" case, same as
+    // the /intake sibling test above: 405, not 404 (404 is reserved for a
+    // GET/HEAD to an unknown path).
+    const { url } = await withRegistry(true);
+    const res = await fetch(`${url}/repository-registry/abc123/delete`, { method: 'POST' });
+    assert.equal(res.status, 405);
+  });
+
+  it('leaves /health, /ingest, and /intake untouched', async () => {
+    const { url } = await withRegistry(true);
+    assert.equal((await fetch(`${url}/health`)).status, 200);
+    assert.equal((await fetch(`${url}/ingest`, { method: 'POST', body: '{}' })).status, 404);
+    assert.equal((await fetch(`${url}/intake/CF-1/approve`, { method: 'POST', body: '{}' })).status, 404);
+  });
+});
+
+describe('/repository-selections routing', () => {
+  async function withSelection(mounted: boolean): Promise<{ url: string }> {
+    const deps: ServerDeps = {
+      logger: createLogger({ write: () => {} }),
+      health: { version: '0.1.0', uptimeSeconds: () => 1, database: undefined },
+      ...(mounted
+        ? {
+            repositorySelection: {
+              logger: createLogger({ write: () => {} }),
+              operatorToken: undefined,
+              selections: undefined,
+              registry: undefined,
+            },
+          }
+        : {}),
+    };
+    const server = createHttpServer(deps);
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address() as AddressInfo;
+    return { url: `http://127.0.0.1:${port}` };
+  }
+
+  it('routes POST /repository-selections/:runId/confirm to the handler', async () => {
+    const { url } = await withSelection(true);
+    const res = await fetch(`${url}/repository-selections/abc123/confirm`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    // No operator token configured, so the handler answers 401 — which
+    // proves the request reached it rather than the 405 or 404 paths.
+    assert.equal(res.status, 401);
+  });
+
+  it('returns 404 when the selection route is not mounted', async () => {
+    const { url } = await withSelection(false);
+    const res = await fetch(`${url}/repository-selections/abc123/confirm`, { method: 'POST', body: '{}' });
+    assert.equal(res.status, 404);
+  });
+
+  it('refuses GET on the confirm route', async () => {
+    const { url } = await withSelection(true);
+    assert.equal((await fetch(`${url}/repository-selections/abc123/confirm`)).status, 405);
+  });
+
+  it('does not match an unrelated action segment', async () => {
+    const { url } = await withSelection(true);
+    const res = await fetch(`${url}/repository-selections/abc123/reject`, { method: 'POST' });
+    assert.equal(res.status, 405);
+  });
+
+  it('leaves /health and /repository-registry untouched', async () => {
+    const { url } = await withSelection(true);
+    assert.equal((await fetch(`${url}/health`)).status, 200);
+    assert.equal((await fetch(`${url}/repository-registry`)).status, 404);
+  });
+});
+
 describe('timeouts', () => {
   it('bounds how long a request can occupy a connection', async () => {
     // Neutara does not retry, so a stalled request costs an event.

@@ -6,6 +6,7 @@ import { DATABASE_NAME } from '../db/client.ts';
 import {
   PRODUCTION_URI_VARIABLES,
   TEST_APP_URI_VARIABLE,
+  TEST_CLEANUP_URI_VARIABLE,
   TEST_DATABASE_VARIABLE,
   TEST_MIGRATION_URI_VARIABLE,
   resolveIntegrationConfig,
@@ -26,12 +27,34 @@ const PRODUCTION_ENV = {
 } as const;
 
 describe('resolveIntegrationConfig', () => {
-  it('resolves when all three test variables are set', () => {
+  it('resolves when all three required test variables are set', () => {
     const result = resolveIntegrationConfig(VALID, DATABASE_NAME);
     assert.ok(result.ok);
     assert.equal(result.config.databaseName, 'aisdlc_test');
     assert.equal(result.config.appUri, VALID.AISDLC_TEST_MONGODB_URI);
     assert.equal(result.config.migrationUri, VALID.AISDLC_TEST_MONGODB_MIGRATION_URI);
+    assert.equal(result.config.cleanupUri, undefined, 'optional and unset here');
+  });
+
+  it('resolves the optional cleanup URI when set', () => {
+    const cleanupUri = 'mongodb+srv://test_cleanup:pw@cluster.example.mongodb.net/?authSource=admin';
+    const result = resolveIntegrationConfig(
+      { ...VALID, [TEST_CLEANUP_URI_VARIABLE]: cleanupUri },
+      DATABASE_NAME,
+    );
+    assert.ok(result.ok);
+    assert.equal(result.config.cleanupUri, cleanupUri);
+  });
+
+  it('does not require the cleanup URI — its absence never blocks the suite', () => {
+    const result = resolveIntegrationConfig(VALID, DATABASE_NAME);
+    assert.ok(result.ok);
+  });
+
+  it('treats a blank cleanup URI as absent', () => {
+    const result = resolveIntegrationConfig({ ...VALID, [TEST_CLEANUP_URI_VARIABLE]: '   ' }, DATABASE_NAME);
+    assert.ok(result.ok);
+    assert.equal(result.config.cleanupUri, undefined);
   });
 
   for (const variable of [
@@ -133,26 +156,31 @@ describe('isolation from production credentials', () => {
     }
   });
 
-  it('the integration test reads no production variable', () => {
-    const source = executableSource('repository.integration.test.ts');
-    for (const variable of PRODUCTION_URI_VARIABLES) {
-      assert.ok(
-        !source.includes(variable),
-        `repository.integration.test.ts references ${variable} outside a comment`,
-      );
-    }
-  });
+  /** Every integration test file in the codebase, checked by the same two static rules below. */
+  const INTEGRATION_TEST_FILES = [
+    'repository.integration.test.ts',
+    '../repository-selection/workflow.integration.test.ts',
+  ];
 
-  it('the integration test reads no individual environment variable', () => {
-    // It may hand `process.env` wholesale to resolveIntegrationConfig — that
-    // is the design. What it must not do is index into it, because that is
-    // how a production variable would get read.
-    const source = executableSource('repository.integration.test.ts');
-    assert.ok(!/process\.env\s*\[/.test(source), 'the integration test indexes into process.env');
-    assert.ok(!/process\.env\s*\./.test(source), 'the integration test reads a process.env property');
-    assert.ok(
-      source.includes('resolveIntegrationConfig(process.env'),
-      'the integration test no longer routes configuration through the guard',
-    );
-  });
+  for (const fileName of INTEGRATION_TEST_FILES) {
+    it(`${fileName} reads no production variable`, () => {
+      const source = executableSource(fileName);
+      for (const variable of PRODUCTION_URI_VARIABLES) {
+        assert.ok(!source.includes(variable), `${fileName} references ${variable} outside a comment`);
+      }
+    });
+
+    it(`${fileName} reads no individual environment variable`, () => {
+      // It may hand `process.env` wholesale to resolveIntegrationConfig — that
+      // is the design. What it must not do is index into it, because that is
+      // how a production variable would get read.
+      const source = executableSource(fileName);
+      assert.ok(!/process\.env\s*\[/.test(source), `${fileName} indexes into process.env`);
+      assert.ok(!/process\.env\s*\./.test(source), `${fileName} reads a process.env property`);
+      assert.ok(
+        source.includes('resolveIntegrationConfig(process.env'),
+        `${fileName} no longer routes configuration through the guard`,
+      );
+    });
+  }
 });

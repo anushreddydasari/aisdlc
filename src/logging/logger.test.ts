@@ -96,11 +96,21 @@ describe('redaction', () => {
       'sk-proj-AAAAAAAABBBBBBBBCCCCCCCC',
       'nta_AAAAAAAABBBBBBBBCCCCCCCC',
       'AKIAIOSFODNN7EXAMPLE',
+      'ghs_AAAAAAAABBBBBBBBCCCCCCCCDDDDDDDD', // GitHub App installation token
+      'ghp_AAAAAAAABBBBBBBBCCCCCCCCDDDDDDDD', // GitHub personal access token
+      'github_pat_AAAAAAAABBBBBBBBCCCCCCCCDDDDDDDD',
+      'eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOjF9.c2lnbmF0dXJlLWJ5dGVz', // JWT (header.payload.signature)
     ];
     for (const token of cases) {
       const out = redact({ note: `token is ${token}` }) as Record<string, string>;
       assert.ok(!out['note']!.includes(token), `leaked ${token}`);
     }
+  });
+
+  it('blanks a PEM private key block appearing anywhere in a value', () => {
+    const key = '-----BEGIN RSA PRIVATE KEY-----\nFAKEKEYDATAFORTESTSONLY\n-----END RSA PRIVATE KEY-----'; // pragma: fixture
+    const out = redact({ note: `key: ${key}` }) as Record<string, string>;
+    assert.ok(!out['note']!.includes('FAKEKEYDATAFORTESTSONLY'), 'leaked the private key body');
   });
 
   it('redacts a secret in the log message itself, not just in fields', () => {

@@ -12,6 +12,15 @@ import type { Logger } from '../logging/logger.ts';
 import { handleApproval, type ApprovalDeps } from './approval.ts';
 import { buildLiveness, buildReadiness, type HealthDeps } from './health.ts';
 import { handleIngest, type IngestDeps } from './ingest.ts';
+import {
+  handleCreateRegistryEntry,
+  handleGetRegistryEntry,
+  handleListRegistryEntries,
+  handleSetRegistryEntryStatus,
+  handleUpdateRegistryEntry,
+  type RepositoryRegistryDeps,
+} from './repository-registry.ts';
+import { handleConfirmRepositorySelection, type RepositorySelectionDeps } from './repository-selection.ts';
 
 export interface ServerDeps {
   readonly logger: Logger;
@@ -25,10 +34,24 @@ export interface ServerDeps {
    * choice /ingest makes for an absent webhook secret).
    */
   readonly approval?: ApprovalDeps | undefined;
+  /** Same "mounted but refuses without a token" choice as `approval`. */
+  readonly repositoryRegistry?: RepositoryRegistryDeps | undefined;
+  /** Same "mounted but refuses without a token" choice as `approval`. */
+  readonly repositorySelection?: RepositorySelectionDeps | undefined;
 }
 
 /** POST /intake/{issueKey}/approve or /reject. issueKey is opaque, so no slashes. */
 const APPROVAL_PATH = /^\/intake\/([^/]+)\/(approve|reject)$/;
+
+/** GET/POST /repository-registry — list or create. */
+const REGISTRY_COLLECTION_PATH = /^\/repository-registry$/;
+/** GET/PATCH /repository-registry/{id} — get or update one entry. */
+const REGISTRY_ITEM_PATH = /^\/repository-registry\/([^/]+)$/;
+/** POST /repository-registry/{id}/deactivate or /reactivate. */
+const REGISTRY_STATUS_PATH = /^\/repository-registry\/([^/]+)\/(deactivate|reactivate)$/;
+
+/** POST /repository-selections/{runId}/confirm. */
+const SELECTION_CONFIRM_PATH = /^\/repository-selections\/([^/]+)\/confirm$/;
 
 /**
  * Neutara does not retry, so a slow or stalled request costs an event. These
@@ -83,6 +106,83 @@ export async function handleRequest(
     }
     const [, issueKey, action] = approvalMatch as unknown as [string, string, 'approve' | 'reject'];
     const result = await handleApproval(req, deps.approval, decodeURIComponent(issueKey), action);
+    sendJson(res, result.statusCode, result.body);
+    return;
+  }
+
+  const registryStatusMatch = REGISTRY_STATUS_PATH.exec(path);
+  if (registryStatusMatch) {
+    if (method !== 'POST') {
+      sendJson(res, 405, { error: 'method_not_allowed' });
+      return;
+    }
+    if (deps.repositoryRegistry === undefined) {
+      sendJson(res, 404, { error: 'not_found' });
+      return;
+    }
+    const [, id, action] = registryStatusMatch as unknown as [string, string, 'deactivate' | 'reactivate'];
+    const result = await handleSetRegistryEntryStatus(
+      req,
+      deps.repositoryRegistry,
+      decodeURIComponent(id),
+      action === 'reactivate' ? 'active' : 'inactive',
+    );
+    sendJson(res, result.statusCode, result.body);
+    return;
+  }
+
+  if (REGISTRY_COLLECTION_PATH.test(path)) {
+    if (method !== 'GET' && method !== 'POST') {
+      sendJson(res, 405, { error: 'method_not_allowed' });
+      return;
+    }
+    if (deps.repositoryRegistry === undefined) {
+      sendJson(res, 404, { error: 'not_found' });
+      return;
+    }
+    const result =
+      method === 'POST'
+        ? await handleCreateRegistryEntry(req, deps.repositoryRegistry)
+        : await handleListRegistryEntries(req, deps.repositoryRegistry, new URL(req.url ?? '/', 'http://localhost').searchParams);
+    sendJson(res, result.statusCode, result.body);
+    return;
+  }
+
+  const registryItemMatch = REGISTRY_ITEM_PATH.exec(path);
+  if (registryItemMatch) {
+    if (method !== 'GET' && method !== 'PATCH') {
+      sendJson(res, 405, { error: 'method_not_allowed' });
+      return;
+    }
+    if (deps.repositoryRegistry === undefined) {
+      sendJson(res, 404, { error: 'not_found' });
+      return;
+    }
+    const [, id] = registryItemMatch as unknown as [string, string];
+    const result =
+      method === 'GET'
+        ? await handleGetRegistryEntry(req, deps.repositoryRegistry, decodeURIComponent(id))
+        : await handleUpdateRegistryEntry(req, deps.repositoryRegistry, decodeURIComponent(id));
+    sendJson(res, result.statusCode, result.body);
+    return;
+  }
+
+  const selectionConfirmMatch = SELECTION_CONFIRM_PATH.exec(path);
+  if (selectionConfirmMatch) {
+    if (method !== 'POST') {
+      sendJson(res, 405, { error: 'method_not_allowed' });
+      return;
+    }
+    if (deps.repositorySelection === undefined) {
+      sendJson(res, 404, { error: 'not_found' });
+      return;
+    }
+    const [, runId] = selectionConfirmMatch as unknown as [string, string];
+    const result = await handleConfirmRepositorySelection(
+      req,
+      deps.repositorySelection,
+      decodeURIComponent(runId),
+    );
     sendJson(res, result.statusCode, result.body);
     return;
   }

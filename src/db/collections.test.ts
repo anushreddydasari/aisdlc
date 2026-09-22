@@ -26,6 +26,13 @@ import {
   OUTBOUND_WRITE_VALIDATOR,
   REQUIREMENTS_ANALYSIS_STATUSES,
   REQUIREMENTS_ANALYSIS_VALIDATOR,
+  REPOSITORY_REGISTRY_STATUSES,
+  REPOSITORY_REGISTRY_VALIDATOR,
+  REPOSITORY_SELECTION_STATUSES,
+  REPOSITORY_SELECTION_VALIDATOR,
+  RUN_STATUSES,
+  RUN_TRIGGERS,
+  RUN_VALIDATOR,
   WEBHOOK_DELIVERY_RETENTION_SECONDS,
   allIndexes,
 } from './collections.ts';
@@ -36,6 +43,8 @@ const APPROVED_COLLECTIONS = [
   'checkpoints',
   'intakeItems',
   'outboundWrites',
+  'repositoryRegistry',
+  'repositorySelections',
   'requirementsAnalyses',
   'runArtifacts',
   'runs',
@@ -115,6 +124,14 @@ describe('index definitions', () => {
       'intakeItems.issueKey_unique',
       // One requirements analysis per intake item; a retry updates it in place.
       'requirementsAnalyses.intakeItemId_unique',
+      // The orchestrator's idempotency guard: at most one queued run per
+      // approved intake item, for this phase (see the index comment).
+      'runs.intakeItemId_unique',
+      // A given repository must not be registered active twice for the
+      // same project (partial: only among active documents).
+      'repositoryRegistry.projectIdentifier_repositoryId_active_unique',
+      // Each run selects at most one repository, ever.
+      'repositorySelections.runId_unique',
       'webhookDeliveries.deliveryId_unique',
     ].sort());
   });
@@ -493,14 +510,163 @@ describe('requirementsAnalyses validator', () => {
   });
 });
 
+describe('runs vocabularies', () => {
+  it('defines the approved run statuses', () => {
+    assert.deepEqual([...RUN_STATUSES], ['queued', 'running', 'succeeded', 'failed', 'cancelled']);
+  });
+
+  it('defines only approval as a trigger for this phase', () => {
+    assert.deepEqual([...RUN_TRIGGERS], ['approval']);
+  });
+});
+
+describe('runs validator', () => {
+  it('is attached with strict enforcement', () => {
+    const options = COLLECTION_OPTIONS[COLLECTIONS.runs];
+    assert.ok(options);
+    assert.equal(options['validationLevel'], 'strict');
+    assert.equal(options['validationAction'], 'error');
+  });
+
+  it('constrains status and trigger to the approved vocabularies', () => {
+    const props = schemaOf(RUN_VALIDATOR).properties;
+    assert.deepEqual(props['status']!['enum'], [...RUN_STATUSES]);
+    assert.deepEqual(props['trigger']!['enum'], [...RUN_TRIGGERS]);
+  });
+
+  it('requires the fields a run cannot exist without', () => {
+    const { required } = schemaOf(RUN_VALIDATOR);
+    for (const field of ['intakeItemId', 'issueKey', 'status', 'trigger', 'createdAt']) {
+      assert.ok(required.includes(field), `${field} is not required`);
+    }
+  });
+
+  it('uses ObjectId for the intake item reference', () => {
+    assert.equal(schemaOf(RUN_VALIDATOR).properties['intakeItemId']!['bsonType'], 'objectId');
+  });
+
+  it('allows startedAt and completedAt to be absent until a future Coding Agent fills them in', () => {
+    const { required, properties } = schemaOf(RUN_VALIDATOR);
+    assert.deepEqual(properties['startedAt']!['bsonType'], ['date', 'null']);
+    assert.deepEqual(properties['completedAt']!['bsonType'], ['date', 'null']);
+    assert.ok(!required.includes('startedAt'));
+    assert.ok(!required.includes('completedAt'));
+  });
+});
+
+describe('repositoryRegistry vocabularies', () => {
+  it('defines active/inactive and nothing else', () => {
+    assert.deepEqual([...REPOSITORY_REGISTRY_STATUSES], ['active', 'inactive']);
+  });
+});
+
+describe('repositoryRegistry validator', () => {
+  it('is attached with strict enforcement', () => {
+    const options = COLLECTION_OPTIONS[COLLECTIONS.repositoryRegistry];
+    assert.ok(options);
+    assert.equal(options['validationLevel'], 'strict');
+    assert.equal(options['validationAction'], 'error');
+  });
+
+  it('constrains status to the approved vocabulary', () => {
+    assert.deepEqual(schemaOf(REPOSITORY_REGISTRY_VALIDATOR).properties['status']!['enum'], [
+      ...REPOSITORY_REGISTRY_STATUSES,
+    ]);
+  });
+
+  it('requires the fields an entry cannot exist without, including actor and timestamp fields', () => {
+    const { required } = schemaOf(REPOSITORY_REGISTRY_VALIDATOR);
+    for (const field of [
+      'projectIdentifier',
+      'repositoryId',
+      'repositoryUrl',
+      'defaultBranch',
+      'allowedBranches',
+      'status',
+      'createdAt',
+      'updatedAt',
+      'createdBy',
+      'updatedBy',
+    ]) {
+      assert.ok(required.includes(field), `${field} is not required`);
+    }
+  });
+
+  it('requires allowedBranches to be a non-empty array of strings', () => {
+    const allowedBranches = schemaOf(REPOSITORY_REGISTRY_VALIDATOR).properties['allowedBranches']!;
+    assert.equal(allowedBranches['bsonType'], 'array');
+    assert.equal(allowedBranches['minItems'], 1);
+  });
+
+  it('allows accessPolicy to be null and does not require it, pending GitHub App design', () => {
+    const { required, properties } = schemaOf(REPOSITORY_REGISTRY_VALIDATOR);
+    assert.deepEqual(properties['accessPolicy']!['bsonType'], ['object', 'null']);
+    assert.ok(!required.includes('accessPolicy'));
+  });
+});
+
+describe('repositorySelections vocabularies', () => {
+  it('defines pending/selected/failed/ambiguous and nothing else', () => {
+    assert.deepEqual([...REPOSITORY_SELECTION_STATUSES], ['pending', 'selected', 'failed', 'ambiguous']);
+  });
+});
+
+describe('repositorySelections validator', () => {
+  it('is attached with strict enforcement', () => {
+    const options = COLLECTION_OPTIONS[COLLECTIONS.repositorySelections];
+    assert.ok(options);
+    assert.equal(options['validationLevel'], 'strict');
+    assert.equal(options['validationAction'], 'error');
+  });
+
+  it('constrains status to the approved vocabulary', () => {
+    assert.deepEqual(schemaOf(REPOSITORY_SELECTION_VALIDATOR).properties['status']!['enum'], [
+      ...REPOSITORY_SELECTION_STATUSES,
+    ]);
+  });
+
+  it('requires the retry bookkeeping fields', () => {
+    const { required } = schemaOf(REPOSITORY_SELECTION_VALIDATOR);
+    for (const field of ['runId', 'intakeItemId', 'issueKey', 'projectIdentifier', 'attempts', 'nextAttemptAt']) {
+      assert.ok(required.includes(field), `${field} is not required`);
+    }
+  });
+
+  it('uses ObjectId for run and intake item references', () => {
+    const props = schemaOf(REPOSITORY_SELECTION_VALIDATOR).properties;
+    assert.equal(props['runId']!['bsonType'], 'objectId');
+    assert.equal(props['intakeItemId']!['bsonType'], 'objectId');
+  });
+
+  it('allows every selected* snapshot field and confirmation field to be null and unrequired before confirmation', () => {
+    const { required, properties } = schemaOf(REPOSITORY_SELECTION_VALIDATOR);
+    for (const field of [
+      'selectedRepositoryId',
+      'selectedRepositoryUrl',
+      'selectedDefaultBranch',
+      'confirmedBy',
+      'confirmedAt',
+    ]) {
+      assert.ok(!required.includes(field), `${field} should not be required`);
+      assert.ok(
+        (properties[field]!['bsonType'] as string[]).includes('null'),
+        `${field} is not nullable`,
+      );
+    }
+  });
+});
+
 describe('collection options coverage', () => {
-  it('validates exactly the six collections with enforced vocabularies', () => {
+  it('validates exactly the nine collections with enforced vocabularies', () => {
     assert.deepEqual(Object.keys(COLLECTION_OPTIONS).sort(), [
       'auditLog',
       'checkpoints',
       'intakeItems',
       'outboundWrites',
+      'repositoryRegistry',
+      'repositorySelections',
       'requirementsAnalyses',
+      'runs',
       'webhookDeliveries',
     ]);
   });
