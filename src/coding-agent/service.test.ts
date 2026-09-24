@@ -158,6 +158,9 @@ function harness(
       githubAccessCalls += 1;
       return options.githubAccessResult ?? githubAccessSuccess();
     },
+    async listFilesForRun(): Promise<never> {
+      throw new Error('must not be called');
+    },
   };
   const repositoryContext: RepositoryContextDeps = {
     githubAccess,

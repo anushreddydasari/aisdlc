@@ -176,6 +176,22 @@ export interface GitHubPullRequestDetails {
 
 export type GetPullRequestResult = ({ readonly ok: true } & GitHubPullRequestDetails) | GitHubAccessFailure;
 
+/** One file (a git blob) in a repository tree. Directories are not listed — only the files in them. */
+export interface GitHubTreeFile {
+  readonly path: string;
+  /** Bytes, as GitHub reports it. */
+  readonly size: number;
+}
+
+/**
+ * `truncated` is GitHub's own flag: a very large repository's recursive
+ * tree is cut off by GitHub, and the caller must know the list is partial
+ * rather than assume it is complete.
+ */
+export type GetTreeResult =
+  | { readonly ok: true; readonly files: readonly GitHubTreeFile[]; readonly truncated: boolean }
+  | GitHubAccessFailure;
+
 /**
  * The full surface Stage 1 needs, plus the minimal Git Data API write
  * surface added for the GitHub Write + Pull Request Workflow phase — see
@@ -208,6 +224,8 @@ export interface GitHubAppClient {
   getRef(installationId: number, owner: string, repo: string, branch: string): Promise<GetRefResult>;
   /** A commit's tree SHA — needed as `createTree`'s base. */
   getCommit(installationId: number, owner: string, repo: string, sha: string): Promise<GetCommitResult>;
+  /** Every file under `treeSha`, recursively — names and sizes only, never content. Read-only. */
+  getTree(installationId: number, owner: string, repo: string, treeSha: string): Promise<GetTreeResult>;
   /** Builds a new tree on top of `baseTreeSha`, replacing/adding exactly `files`. Creates no ref — the resulting tree is unreachable until a commit and a ref both point at it. */
   createTree(
     installationId: number,

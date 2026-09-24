@@ -204,6 +204,9 @@ function trackedGitHubAccess(
           githubAccessSuccess({ files: filePaths.map((p) => ({ path: p, content: options.liveContent ?? LIVE_CONTENT })) })
         );
       },
+      async listFilesForRun(): Promise<never> {
+        throw new Error('must not be called');
+      },
     },
   };
   return counted;

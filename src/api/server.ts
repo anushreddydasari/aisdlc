@@ -31,6 +31,7 @@ import { REPOSITORY_UI_HTML, REPOSITORY_UI_DELETE_FLAG_OFF, REPOSITORY_UI_DELETE
 import { handleDeleteRegistryEntry, type RegistryDeleteDeps } from './registry-delete.ts';
 import { handleConfirmRepositorySelection, type RepositorySelectionDeps } from './repository-selection.ts';
 import { handleGetRunStatus, type RunStatusDeps } from './run-status.ts';
+import { handleGetSuggestedFiles, type SuggestedFilesDeps } from './suggested-files.ts';
 
 export interface ServerDeps {
   readonly logger: Logger;
@@ -66,6 +67,8 @@ export interface ServerDeps {
   readonly ticketDelete?: TicketDeleteDeps | undefined;
   /** Test mode only — absent means the registry delete route answers 404 and the page shows no Delete. */
   readonly registryDelete?: RegistryDeleteDeps | undefined;
+  /** Mounted only with a GitHub App client, like `codingAgent`. */
+  readonly suggestedFiles?: SuggestedFilesDeps | undefined;
 }
 
 /** POST /intake/{issueKey}/approve or /reject. issueKey is opaque, so no slashes. */
@@ -88,6 +91,8 @@ const TICKET_DELETE_PATH = /^\/operator\/tickets\/([^/]+)\/delete$/;
 
 /** GET /runs/{runId} — the composed end-to-end status view. */
 const RUN_STATUS_PATH = /^\/runs\/([^/]+)$/;
+/** GET /runs/{runId}/suggested-files. */
+const RUN_SUGGESTED_FILES_PATH = /^\/runs\/([^/]+)\/suggested-files$/;
 /** POST /runs/{runId}/coding-agent. */
 const RUN_CODING_AGENT_PATH = /^\/runs\/([^/]+)\/coding-agent$/;
 /** POST /change-reviews/{reviewId}/approve or /reject. */
@@ -266,6 +271,22 @@ export async function handleRequest(
       deps.repositorySelection,
       decodeURIComponent(runId),
     );
+    sendJson(res, result.statusCode, result.body);
+    return;
+  }
+
+  const suggestedFilesMatch = RUN_SUGGESTED_FILES_PATH.exec(path);
+  if (suggestedFilesMatch) {
+    if (method !== 'GET') {
+      sendJson(res, 405, { error: 'method_not_allowed' });
+      return;
+    }
+    if (deps.suggestedFiles === undefined) {
+      sendJson(res, 404, { error: 'not_found' });
+      return;
+    }
+    const [, runId] = suggestedFilesMatch as unknown as [string, string];
+    const result = await handleGetSuggestedFiles(req, deps.suggestedFiles, decodeURIComponent(runId));
     sendJson(res, result.statusCode, result.body);
     return;
   }

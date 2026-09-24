@@ -256,6 +256,10 @@ function harness(
       clientCalls.push({ method: 'getPullRequest' });
       return rawClient.getPullRequest(...args);
     },
+    getTree: (...args) => {
+      clientCalls.push({ method: 'getTree' });
+      return rawClient.getTree(...args);
+    },
   };
 
   const audit: AuditLog = {
@@ -479,6 +483,9 @@ describe('repository identity validation (propagated from the GitHub client)', (
       async getPullRequest() {
         throw new Error('must not be called');
       },
+      async getTree() {
+        throw new Error('must not be called');
+      },
     };
     const h = harness({ client });
     const service = createGitHubAccessService(h.deps);
@@ -525,6 +532,9 @@ describe('repository identity validation (propagated from the GitHub client)', (
         throw new Error('must not be called');
       },
       async getPullRequest() {
+        throw new Error('must not be called');
+      },
+      async getTree() {
         throw new Error('must not be called');
       },
     };
@@ -777,5 +787,42 @@ describe('no real network calls', () => {
     // Documented, not asserted at runtime: see the module header and every
     // harness() call above, none of which ever imports real-client.ts.
     assert.ok(true);
+  });
+});
+
+describe('listFilesForRun', () => {
+  it('lists every file on the confirmed branch — names and sizes, no content — and audits it', async () => {
+    const h = harness();
+    const service = createGitHubAccessService(h.deps);
+    const result = await service.listFilesForRun(RUN_ID);
+
+    assert.ok(result.ok);
+    assert.equal(result.branch, 'main');
+    assert.deepEqual(result.files.map((f) => f.path), ['README.md', 'src/index.ts']);
+    assert.ok(result.files.every((f) => typeof f.size === 'number' && !('content' in f)));
+    assert.equal(result.truncated, false);
+    const listed = h.auditEntries.find((e) => e.action === 'github.tree.listed');
+    assert.ok(listed);
+    assert.equal((listed!.detail as Record<string, unknown>)['fileCount'], 2);
+  });
+
+  it('applies the same checks as reading files: an unconfirmed selection never reaches GitHub', async () => {
+    const h = harness({ selection: selection({ status: 'pending', confirmedBy: null, confirmedAt: null }) });
+    const result = await createGitHubAccessService(h.deps).listFilesForRun(RUN_ID);
+    assert.equal(result.ok, false);
+    assert.equal(result.ok === false && result.category, 'selection_not_confirmed');
+    assert.equal(h.clientCalls.length, 0);
+  });
+
+  it('refuses an intake item that is not approved', async () => {
+    const h = harness({ intakeItem: intakeItem({ status: 'rejected' }) });
+    const result = await createGitHubAccessService(h.deps).listFilesForRun(RUN_ID);
+    assert.equal(result.ok === false && result.category, 'intake_not_approved');
+  });
+
+  it('refuses a missing run', async () => {
+    const h = harness({ run: null });
+    const result = await createGitHubAccessService(h.deps).listFilesForRun(RUN_ID);
+    assert.equal(result.ok === false && result.category, 'run_not_found');
   });
 });

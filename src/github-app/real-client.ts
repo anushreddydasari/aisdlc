@@ -51,6 +51,8 @@ import type {
   CreateTreeResult,
   FindPullRequestResult,
   GetCommitResult,
+  GetTreeResult,
+  GitHubTreeFile,
   GetFileContentsResult,
   GetPullRequestResult,
   GetRefResult,
@@ -368,6 +370,33 @@ export function createRealGitHubAppClient(options: RealGitHubAppClientOptions): 
       if (typeof treeSha !== 'string') return failure('malformed', 'response was missing tree.sha');
 
       return { ok: true, treeSha };
+    },
+
+    async getTree(installationId: number, owner: string, repo: string, treeSha: string): Promise<GetTreeResult> {
+      const issued = await tokenIssuer.getInstallationToken(installationId);
+      if (!issued.ok) return issued;
+
+      const url = `${baseUrl}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/trees/${encodeURIComponent(treeSha)}?recursive=1`;
+      const result = await request(url, `Bearer ${issued.token}`);
+      if (!('status' in result)) return result;
+
+      if (result.status === 404) return failure('malformed', `tree '${treeSha}' does not exist on ${owner}/${repo}`);
+      const commonFailure = commonStatusFailure(result);
+      if (commonFailure !== null) return commonFailure;
+
+      const body = typeof result.body === 'object' && result.body !== null ? (result.body as Record<string, unknown>) : null;
+      const entries = body?.['tree'];
+      if (!Array.isArray(entries)) return failure('malformed', 'response was missing tree[]');
+
+      // Blobs only: directories ('tree') are implied by their files, and
+      // submodules ('commit') point at other repositories entirely.
+      const files: GitHubTreeFile[] = [];
+      for (const entry of entries) {
+        const e = entry as Record<string, unknown>;
+        if (e['type'] !== 'blob' || typeof e['path'] !== 'string') continue;
+        files.push({ path: e['path'], size: typeof e['size'] === 'number' ? e['size'] : 0 });
+      }
+      return { ok: true, files, truncated: body?.['truncated'] === true };
     },
 
     async createTree(

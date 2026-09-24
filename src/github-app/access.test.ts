@@ -158,6 +158,10 @@ function harness(
       clientCalls.push({ method: 'getPullRequest' });
       return rawClient.getPullRequest(...args);
     },
+    getTree: (...args) => {
+      clientCalls.push({ method: 'getTree' });
+      return rawClient.getTree(...args);
+    },
   };
 
   return {

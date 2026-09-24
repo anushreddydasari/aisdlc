@@ -30,6 +30,7 @@ import type {
   CreateTreeResult,
   FindPullRequestResult,
   GetCommitResult,
+  GetTreeResult,
   GetFileContentsResult,
   GetPullRequestResult,
   GetRefResult,
@@ -304,6 +305,21 @@ export function createMockGitHubAppClient(config: MockGitHubAppClientConfig = {}
         return { ok: false, kind: 'malformed', message: `commit '${sha}' does not exist on ${owner}/${repo}` };
       }
       return { ok: true, treeSha: commit.treeSha };
+    },
+
+    async getTree(installationId: number, owner: string, repo: string, treeSha: string): Promise<GetTreeResult> {
+      const found = findRepository(repositories, owner, repo);
+      if (found === undefined || found.installationId !== installationId) {
+        return { ok: false, kind: 'installation_not_found', message: `installation ${installationId} does not cover ${owner}/${repo}` };
+      }
+      const tree = stateFor(installationId).trees.get(treeSha);
+      if (tree === undefined) {
+        return { ok: false, kind: 'malformed', message: `tree '${treeSha}' does not exist on ${owner}/${repo}` };
+      }
+      const files = [...tree.entries()]
+        .map(([path, content]) => ({ path, size: Buffer.byteLength(content, 'utf8') }))
+        .sort((a, b) => a.path.localeCompare(b.path));
+      return { ok: true, files, truncated: false };
     },
 
     async createTree(
