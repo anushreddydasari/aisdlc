@@ -4,6 +4,8 @@ import { describe, it } from 'node:test';
 import {
   ConfigError,
   DEFAULT_OPENAI_MODEL,
+  classifyNeutaraMode,
+  describeNeutaraStartup,
   isMongoUri,
   loadOpenAiConfig,
   loadConfig,
@@ -692,7 +694,91 @@ describe('loadNeutaraConfig', () => {
       OPERATOR_TOKEN: 'op_x',
     });
     assert.ok(result.configured);
-    assert.deepEqual(Object.keys(result.config).sort(), ['baseUrl', 'token']);
+    assert.deepEqual(Object.keys(result.config).sort(), ['baseUrl', 'mode', 'token']);
+  });
+
+  describe('mode classification (switching between mock and real Neutara)', () => {
+    it('classifies a loopback base URL as mock mode', () => {
+      const result = loadNeutaraConfig({ ...NEUTARA_ENV, NEUTARA_API_BASE_URL: 'http://127.0.0.1:4601' });
+      assert.ok(result.configured);
+      assert.equal(result.config.mode, 'mock');
+    });
+
+    it('classifies a real, non-loopback base URL as real mode', () => {
+      const result = loadNeutaraConfig({ ...NEUTARA_ENV, NEUTARA_API_BASE_URL: 'https://neutara-test.example.com' });
+      assert.ok(result.configured);
+      assert.equal(result.config.mode, 'real');
+    });
+
+    it('switching NEUTARA_API_BASE_URL alone moves between modes — no other variable or code path is involved', () => {
+      const mock = loadNeutaraConfig({ ...NEUTARA_ENV, NEUTARA_API_BASE_URL: 'http://127.0.0.1:4601' });
+      const real = loadNeutaraConfig({ ...NEUTARA_ENV, NEUTARA_API_BASE_URL: 'https://neutara-test.example.com' });
+      assert.ok(mock.configured && real.configured);
+      assert.equal(mock.config.token, real.config.token);
+      assert.notEqual(mock.config.mode, real.config.mode);
+    });
+  });
+});
+
+describe('classifyNeutaraMode', () => {
+  it('treats every documented loopback hostname as mock mode', () => {
+    for (const baseUrl of ['http://127.0.0.1:4601', 'http://localhost:4601', 'http://LOCALHOST:4601', 'https://127.0.0.1']) {
+      assert.equal(classifyNeutaraMode(baseUrl), 'mock', baseUrl);
+    }
+  });
+
+  it('treats any non-loopback origin as real mode', () => {
+    for (const baseUrl of ['https://neutara.example.com', 'https://neutara-test.example.com', 'http://10.0.0.5:8080', 'https://staging.internal.example.com']) {
+      assert.equal(classifyNeutaraMode(baseUrl), 'real', baseUrl);
+    }
+  });
+
+  it('never throws on an unparseable value — defaults to real rather than guessing', () => {
+    assert.equal(classifyNeutaraMode('not-a-url'), 'real');
+  });
+});
+
+describe('describeNeutaraStartup', () => {
+  it('reports mock mode clearly', () => {
+    const result = loadNeutaraConfig({ ...NEUTARA_ENV, NEUTARA_API_BASE_URL: 'http://127.0.0.1:4601' });
+    const report = describeNeutaraStartup(result);
+    assert.equal(report.configured, true);
+    assert.equal(report.mode, 'mock');
+    assert.match(report.message, /MOCK/);
+  });
+
+  it('reports real mode clearly, distinguishably from mock', () => {
+    const result = loadNeutaraConfig(NEUTARA_ENV);
+    const report = describeNeutaraStartup(result);
+    assert.equal(report.configured, true);
+    assert.equal(report.mode, 'real');
+    assert.match(report.message, /REAL/);
+    assert.doesNotMatch(report.message, /MOCK/);
+  });
+
+  it('reports missing configuration clearly, naming the variable', () => {
+    const result = loadNeutaraConfig({});
+    const report = describeNeutaraStartup(result);
+    assert.equal(report.configured, false);
+    assert.equal(report.mode, null);
+    assert.match(report.message, /NEUTARA_API_BASE_URL/);
+    assert.match(report.message, /NEUTARA_API_TOKEN/);
+  });
+
+  it('never includes the token in the startup report, in any mode', () => {
+    for (const baseUrl of ['http://127.0.0.1:4601', 'https://neutara-test.example.com']) {
+      const result = loadNeutaraConfig({ ...NEUTARA_ENV, NEUTARA_API_BASE_URL: baseUrl });
+      const report = describeNeutaraStartup(result);
+      const serialized = JSON.stringify(report);
+      assert.ok(!serialized.includes(FAKE_TOKEN), 'the token reached the startup report');
+      assert.ok(!serialized.includes('nta_'), 'a token prefix reached the startup report');
+    }
+  });
+
+  it('never includes the base URL value in the startup report', () => {
+    const result = loadNeutaraConfig({ ...NEUTARA_ENV, NEUTARA_API_BASE_URL: 'https://secret-neutara-host.example.com' });
+    const report = describeNeutaraStartup(result);
+    assert.ok(!JSON.stringify(report).includes('secret-neutara-host'));
   });
 });
 

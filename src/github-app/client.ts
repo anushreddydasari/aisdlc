@@ -13,6 +13,29 @@
  * failing in an expected way (not found, rate limited, insufficient
  * permission) is a normal outcome for a network client to report, not an
  * exceptional one for it to throw.
+ *
+ * WRITE OPERATIONS (docs/change-execution.md's next phase: GitHub Write +
+ * Pull Request Workflow). Six methods below (`getRef` through
+ * `findPullRequestForBranch`) are the ONLY write-capable additions to this
+ * interface — deliberately the minimal set the Git Data API needs for "one
+ * branch, one commit, one PR" per approved execution: `getRef`/`getCommit`
+ * read the base branch's current state; `createTree`/`createCommit` build
+ * a single new commit off of it (git objects with no ref pointing at them
+ * are simply unreachable garbage if abandoned — safe to retry blindly,
+ * unlike the next two); `createBranch` is the one call that actually
+ * publishes anything (equivalent to `git push` for a brand-new branch —
+ * there is no separate "push" primitive in the REST API); `createPullRequest`
+ * and its `findPullRequestForBranch` reconciliation counterpart open the
+ * PR. No method here can modify or delete an EXISTING branch, and nothing
+ * in this codebase ever calls one with a protected/base branch name — see
+ * `github-publish/publish-service.ts`.
+ *
+ * PR MERGE DETECTION (deployment/pr-merge-detection.ts). `getPullRequest`
+ * is the one further addition, and it is READ-ONLY — it reports whether a
+ * PR has been merged (and by what commit), it never merges one. There is
+ * no `mergePullRequest`, `approvePullRequest`, or `autoMerge` method
+ * anywhere in this interface, deliberately: a human merges through
+ * GitHub's own UI, and this client can only ever observe that afterwards.
  */
 
 /**
@@ -45,20 +68,28 @@ export type GitHubAccessFailureKind =
   | 'branch_not_found'
   /** GitHub: the path does not exist at the given ref. */
   | 'file_not_found'
-  /** GitHub: the installation lacks a permission the operation needs. */
+  /** GitHub: the credential itself (App JWT or installation token) was rejected (401) — distinct from `insufficient_permission`, which means the credential is valid but lacks a specific permission. */
+  | 'authentication_failed'
+  /** GitHub: the credential is valid but the installation lacks a permission the operation needs (403, no rate-limit evidence). */
   | 'insufficient_permission'
   /** GitHub: rate limited (primary or secondary). Worth retrying after `retryAfterMs`. */
   | 'rate_limited'
-  /** GitHub: a transport failure or 5xx. Worth retrying with backoff. */
+  /** The request did not complete within the configured timeout. Worth retrying — distinct from `transient` so a caller can tell "GitHub was slow" from "GitHub was unreachable/errored". */
+  | 'timeout'
+  /** GitHub: a transport failure (not a timeout) or a 5xx. Worth retrying with backoff. */
   | 'transient'
   /** The response was not the shape a caller requires. Retrying will not help — mirrors neutara/client.ts's 'malformed'. */
   | 'malformed'
   /** GitHub responded with a redirect (e.g. a renamed repository). Never followed — see real-client.ts. */
-  | 'unexpected_redirect';
+  | 'unexpected_redirect'
+  /** GitHub: a ref with this exact name already exists (422) — `createBranch` never overwrites an existing ref. */
+  | 'ref_already_exists'
+  /** GitHub: a pull request already exists for this exact head/base pair (422). */
+  | 'pull_request_already_exists';
 
 /** Whether another attempt could plausibly succeed. Only true for conditions GitHub itself calls transient. */
 export function isRetryable(kind: GitHubAccessFailureKind): boolean {
-  return kind === 'rate_limited' || kind === 'transient';
+  return kind === 'rate_limited' || kind === 'transient' || kind === 'timeout';
 }
 
 export interface GitHubAccessFailure {
@@ -95,9 +126,61 @@ export type GetRepositoryMetadataResult =
 
 export type GetFileContentsResult = { readonly ok: true; readonly content: string } | GitHubAccessFailure;
 
+/** The current commit SHA a branch (ref) points at. */
+export type GetRefResult = { readonly ok: true; readonly sha: string } | GitHubAccessFailure;
+
+/** A commit's tree SHA — the base a new tree is built on top of. */
+export type GetCommitResult = { readonly ok: true; readonly treeSha: string } | GitHubAccessFailure;
+
+/** One file's full new content, to be written into a new tree. Never a diff/patch — the complete file, matching `ProposedChange.proposedContent`. */
+export interface TreeFileEntry {
+  readonly path: string;
+  readonly content: string;
+}
+
+export type CreateTreeResult = { readonly ok: true; readonly sha: string } | GitHubAccessFailure;
+
+export type CreateCommitResult = { readonly ok: true; readonly sha: string } | GitHubAccessFailure;
+
+export type CreateBranchResult = { readonly ok: true } | GitHubAccessFailure;
+
+export interface GitHubPullRequestSummary {
+  readonly number: number;
+  readonly htmlUrl: string;
+  readonly state: string;
+}
+
+export type CreatePullRequestResult = ({ readonly ok: true } & GitHubPullRequestSummary) | GitHubAccessFailure;
+
+/** Null when no open pull request exists for this exact head/base pair — not a failure. */
+export type FindPullRequestResult =
+  | { readonly ok: true; readonly pullRequest: GitHubPullRequestSummary | null }
+  | GitHubAccessFailure;
+
 /**
- * The full surface Stage 1 needs. A real implementation would additionally
- * hold the App id and private key (see token-issuer.ts in the design doc);
+ * Everything PR-merge detection needs to know, and nothing else. `merged`
+ * is GitHub's own boolean, never inferred from `state` alone — a `closed`
+ * PR is not necessarily a merged one, and this client never guesses.
+ * `mergeCommitSha` is null until `merged` is true.
+ */
+export interface GitHubPullRequestDetails {
+  readonly number: number;
+  readonly htmlUrl: string;
+  /** 'open' | 'closed' — exactly what GitHub reports. */
+  readonly state: string;
+  readonly merged: boolean;
+  readonly mergeCommitSha: string | null;
+  readonly headRef: string;
+  readonly baseRef: string;
+}
+
+export type GetPullRequestResult = ({ readonly ok: true } & GitHubPullRequestDetails) | GitHubAccessFailure;
+
+/**
+ * The full surface Stage 1 needs, plus the minimal Git Data API write
+ * surface added for the GitHub Write + Pull Request Workflow phase — see
+ * the module comment above. A real implementation would additionally hold
+ * the App id and private key (see token-issuer.ts in the design doc);
  * neither belongs on this interface, which describes only what a caller —
  * the future run-execution worker — needs to be able to do.
  */
@@ -120,4 +203,50 @@ export interface GitHubAppClient {
     path: string,
     ref: string,
   ): Promise<GetFileContentsResult>;
+
+  /** The current commit SHA `branch` points at. Also how a caller checks whether a branch exists at all. */
+  getRef(installationId: number, owner: string, repo: string, branch: string): Promise<GetRefResult>;
+  /** A commit's tree SHA — needed as `createTree`'s base. */
+  getCommit(installationId: number, owner: string, repo: string, sha: string): Promise<GetCommitResult>;
+  /** Builds a new tree on top of `baseTreeSha`, replacing/adding exactly `files`. Creates no ref — the resulting tree is unreachable until a commit and a ref both point at it. */
+  createTree(
+    installationId: number,
+    owner: string,
+    repo: string,
+    baseTreeSha: string,
+    files: readonly TreeFileEntry[],
+  ): Promise<CreateTreeResult>;
+  /** Creates a commit object. Creates no ref — see `createTree`'s comment; the same applies here. */
+  createCommit(
+    installationId: number,
+    owner: string,
+    repo: string,
+    message: string,
+    treeSha: string,
+    parentShas: readonly string[],
+  ): Promise<CreateCommitResult>;
+  /**
+   * Creates a NEW branch (`refs/heads/<branch>`) pointing at `sha` — the
+   * one call in this interface with an externally visible, non-idempotent
+   * side effect (the git-push equivalent). Fails with `ref_already_exists`
+   * rather than overwriting an existing ref of the same name.
+   */
+  createBranch(installationId: number, owner: string, repo: string, branch: string, sha: string): Promise<CreateBranchResult>;
+  /** Opens a pull request from `head` into `base`. Fails with `pull_request_already_exists` if one is already open for this exact pair — see `findPullRequestForBranch` for recovering it instead of retrying. */
+  createPullRequest(
+    installationId: number,
+    owner: string,
+    repo: string,
+    input: { readonly title: string; readonly body: string; readonly head: string; readonly base: string },
+  ): Promise<CreatePullRequestResult>;
+  /** Reconciliation lookup: does an open pull request already exist for this exact head/base pair? Used to recover from an ambiguous (timed-out) `createPullRequest` call rather than blindly retrying it. */
+  findPullRequestForBranch(
+    installationId: number,
+    owner: string,
+    repo: string,
+    head: string,
+    base: string,
+  ): Promise<FindPullRequestResult>;
+  /** Full PR details, by number — the one merge-detection needs `merged`/`mergeCommitSha` for. Read-only; see the module comment above. */
+  getPullRequest(installationId: number, owner: string, repo: string, number: number): Promise<GetPullRequestResult>;
 }

@@ -126,6 +126,38 @@ function harness(
       clientCalls.push({ method: 'getFileContents' });
       return rawClient.getFileContents(...args);
     },
+    getRef: (...args) => {
+      clientCalls.push({ method: 'getRef' });
+      return rawClient.getRef(...args);
+    },
+    getCommit: (...args) => {
+      clientCalls.push({ method: 'getCommit' });
+      return rawClient.getCommit(...args);
+    },
+    createTree: (...args) => {
+      clientCalls.push({ method: 'createTree' });
+      return rawClient.createTree(...args);
+    },
+    createCommit: (...args) => {
+      clientCalls.push({ method: 'createCommit' });
+      return rawClient.createCommit(...args);
+    },
+    createBranch: (...args) => {
+      clientCalls.push({ method: 'createBranch' });
+      return rawClient.createBranch(...args);
+    },
+    createPullRequest: (...args) => {
+      clientCalls.push({ method: 'createPullRequest' });
+      return rawClient.createPullRequest(...args);
+    },
+    findPullRequestForBranch: (...args) => {
+      clientCalls.push({ method: 'findPullRequestForBranch' });
+      return rawClient.findPullRequestForBranch(...args);
+    },
+    getPullRequest: (...args) => {
+      clientCalls.push({ method: 'getPullRequest' });
+      return rawClient.getPullRequest(...args);
+    },
   };
 
   return {

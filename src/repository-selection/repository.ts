@@ -278,3 +278,36 @@ export function createRepositorySelectionRepository(
     },
   };
 }
+
+/**
+ * Read-only listings for the Operator Console (api/operator-queue.ts).
+ * Deliberately NOT on RepositorySelectionRepository: nothing in the
+ * pipeline needs "list everything awaiting a human", and keeping it off the
+ * shared interface means no worker can grow a dependency on it.
+ */
+export interface SelectionQueueQueries {
+  /** `pending` and `ambiguous` rows — the only statuses confirm() accepts — plus `failed`, so a missing mapping is visible. Oldest first. */
+  awaitingConfirmation(limit: number): Promise<RepositorySelectionDocument[]>;
+  /** Most recently confirmed first. */
+  recentlyConfirmed(limit: number): Promise<RepositorySelectionDocument[]>;
+}
+
+export function createSelectionQueueQueries(db: Db): SelectionQueueQueries {
+  const collection: Collection<RepositorySelectionDocument> = db.collection(COLLECTIONS.repositorySelections);
+  return {
+    async awaitingConfirmation(limit) {
+      return collection
+        .find({ status: { $in: ['pending', 'ambiguous', 'failed'] } } as Filter<RepositorySelectionDocument>)
+        .sort({ createdAt: 1 })
+        .limit(limit)
+        .toArray();
+    },
+    async recentlyConfirmed(limit) {
+      return collection
+        .find({ status: 'selected' } as Filter<RepositorySelectionDocument>)
+        .sort({ confirmedAt: -1 })
+        .limit(limit)
+        .toArray();
+    },
+  };
+}

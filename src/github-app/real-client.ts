@@ -45,12 +45,21 @@ import {
   normalizeBaseUrl,
 } from './http.ts';
 import type {
+  CreateBranchResult,
+  CreateCommitResult,
+  CreatePullRequestResult,
+  CreateTreeResult,
+  FindPullRequestResult,
+  GetCommitResult,
   GetFileContentsResult,
+  GetPullRequestResult,
+  GetRefResult,
   GetRepositoryMetadataResult,
   GitHubAccessFailure,
   GitHubAccessFailureKind,
   GitHubAppClient,
   ResolveInstallationResult,
+  TreeFileEntry,
 } from './client.ts';
 
 export interface RealGitHubAppClientOptions {
@@ -107,18 +116,24 @@ export function createRealGitHubAppClient(options: RealGitHubAppClientOptions): 
   const timeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
   const now = options.now ?? (() => new Date());
 
-  async function request(url: string, authorization: string): Promise<RawResponse | GitHubAccessFailure> {
+  async function request(
+    url: string,
+    authorization: string,
+    init: { readonly method?: string; readonly body?: unknown } = {},
+  ): Promise<RawResponse | GitHubAccessFailure> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
       let response: Response;
       try {
+        const headers = githubRequestHeaders(authorization);
         response = await doFetch(url, {
-          method: 'GET',
+          method: init.method ?? 'GET',
           // The only place the JWT or installation token appears. Never
           // logged, never stored, never included in a failure message.
-          headers: githubRequestHeaders(authorization),
+          headers: init.body === undefined ? headers : { ...headers, 'content-type': 'application/json' },
+          ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
           redirect: 'error',
           signal: controller.signal,
         });
@@ -142,7 +157,9 @@ export function createRealGitHubAppClient(options: RealGitHubAppClientOptions): 
     } catch (error) {
       const aborted = error instanceof Error && error.name === 'AbortError';
       logger.warn('github api request failed', { timedOut: aborted, error });
-      return failure('transient', aborted ? `request timed out after ${timeoutMs}ms` : 'request failed');
+      return aborted
+        ? failure('timeout', `request timed out after ${timeoutMs}ms`)
+        : failure('transient', 'request failed');
     } finally {
       clearTimeout(timer);
     }
@@ -153,11 +170,17 @@ export function createRealGitHubAppClient(options: RealGitHubAppClientOptions): 
    * shares. Deliberately excludes 404 — every caller needs its own 404
    * kind and message (and getFileContents needs to inspect the body to
    * pick between two different kinds), so each handles that status itself
-   * before calling this. Returns null when the caller must interpret a 200
-   * itself.
+   * before calling this. Also excludes 422 for the two write methods that
+   * need it to mean something specific (`ref_already_exists`,
+   * `pull_request_already_exists`) rather than a generic `malformed` —
+   * every other caller falls through to the generic 422-is-malformed
+   * handling here, since GitHub uses 422 for validation errors it has no
+   * more specific kind for. Returns null when the caller must interpret a
+   * success status itself; `okStatuses` defaults to `[200]` (every GET),
+   * overridden by write methods that expect `201`.
    */
-  function commonStatusFailure(result: RawResponse): GitHubAccessFailure | null {
-    if (result.status === 401) return failure('insufficient_permission', 'github rejected the credential');
+  function commonStatusFailure(result: RawResponse, okStatuses: readonly number[] = [200]): GitHubAccessFailure | null {
+    if (result.status === 401) return failure('authentication_failed', 'github rejected the credential');
 
     const rateLimit = classifyRateLimit(result.status, result.headers, now());
     if (rateLimit.limited) {
@@ -167,8 +190,15 @@ export function createRealGitHubAppClient(options: RealGitHubAppClientOptions): 
       return failure('insufficient_permission', 'github refused the request (403, not rate-limited)');
     }
     if (result.status >= 500) return failure('transient', `github returned ${result.status}`);
-    if (result.status !== 200) return failure('malformed', `github returned unexpected status ${result.status}`);
-    return null;
+    if (okStatuses.includes(result.status)) return null;
+    return failure('malformed', `github returned unexpected status ${result.status}`);
+  }
+
+  /** The `message` GitHub embeds in an error-response body, when present. */
+  function responseErrorMessage(result: RawResponse): string | undefined {
+    const body = typeof result.body === 'object' && result.body !== null ? (result.body as Record<string, unknown>) : null;
+    const message = body?.['message'];
+    return typeof message === 'string' ? message : undefined;
   }
 
   return {
@@ -296,6 +326,233 @@ export function createRealGitHubAppClient(options: RealGitHubAppClientOptions): 
       if (decoded === null) return failure('malformed', 'response content was not valid base64');
 
       return { ok: true, content: decoded };
+    },
+
+    async getRef(installationId: number, owner: string, repo: string, branch: string): Promise<GetRefResult> {
+      const issued = await tokenIssuer.getInstallationToken(installationId);
+      if (!issued.ok) return issued;
+
+      const url = `${baseUrl}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/ref/${encodeContentsPath(`heads/${branch}`)}`;
+      const result = await request(url, `Bearer ${issued.token}`);
+      if (!('status' in result)) return result;
+
+      if (result.status === 404) {
+        return failure('branch_not_found', `ref '${branch}' does not exist on ${owner}/${repo}`);
+      }
+      const commonFailure = commonStatusFailure(result);
+      if (commonFailure !== null) return commonFailure;
+
+      const body = typeof result.body === 'object' && result.body !== null ? (result.body as Record<string, unknown>) : null;
+      const object = typeof body?.['object'] === 'object' && body['object'] !== null ? (body['object'] as Record<string, unknown>) : null;
+      const sha = object?.['sha'];
+      if (typeof sha !== 'string') return failure('malformed', 'response was missing object.sha');
+
+      return { ok: true, sha };
+    },
+
+    async getCommit(installationId: number, owner: string, repo: string, sha: string): Promise<GetCommitResult> {
+      const issued = await tokenIssuer.getInstallationToken(installationId);
+      if (!issued.ok) return issued;
+
+      const url = `${baseUrl}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/commits/${encodeURIComponent(sha)}`;
+      const result = await request(url, `Bearer ${issued.token}`);
+      if (!('status' in result)) return result;
+
+      if (result.status === 404) return failure('malformed', `commit '${sha}' does not exist on ${owner}/${repo}`);
+      const commonFailure = commonStatusFailure(result);
+      if (commonFailure !== null) return commonFailure;
+
+      const body = typeof result.body === 'object' && result.body !== null ? (result.body as Record<string, unknown>) : null;
+      const tree = typeof body?.['tree'] === 'object' && body['tree'] !== null ? (body['tree'] as Record<string, unknown>) : null;
+      const treeSha = tree?.['sha'];
+      if (typeof treeSha !== 'string') return failure('malformed', 'response was missing tree.sha');
+
+      return { ok: true, treeSha };
+    },
+
+    async createTree(
+      installationId: number,
+      owner: string,
+      repo: string,
+      baseTreeSha: string,
+      files: readonly TreeFileEntry[],
+    ): Promise<CreateTreeResult> {
+      const issued = await tokenIssuer.getInstallationToken(installationId);
+      if (!issued.ok) return issued;
+
+      const url = `${baseUrl}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/trees`;
+      const payload = {
+        base_tree: baseTreeSha,
+        tree: files.map((file) => ({ path: file.path, mode: '100644', type: 'blob', content: file.content })),
+      };
+      const result = await request(url, `Bearer ${issued.token}`, { method: 'POST', body: payload });
+      if (!('status' in result)) return result;
+
+      const commonFailure = commonStatusFailure(result, [201]);
+      if (commonFailure !== null) return commonFailure;
+
+      const body = typeof result.body === 'object' && result.body !== null ? (result.body as Record<string, unknown>) : null;
+      const sha = body?.['sha'];
+      if (typeof sha !== 'string') return failure('malformed', 'response was missing sha');
+
+      return { ok: true, sha };
+    },
+
+    async createCommit(
+      installationId: number,
+      owner: string,
+      repo: string,
+      message: string,
+      treeSha: string,
+      parentShas: readonly string[],
+    ): Promise<CreateCommitResult> {
+      const issued = await tokenIssuer.getInstallationToken(installationId);
+      if (!issued.ok) return issued;
+
+      const url = `${baseUrl}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/commits`;
+      const payload = { message, tree: treeSha, parents: [...parentShas] };
+      const result = await request(url, `Bearer ${issued.token}`, { method: 'POST', body: payload });
+      if (!('status' in result)) return result;
+
+      const commonFailure = commonStatusFailure(result, [201]);
+      if (commonFailure !== null) return commonFailure;
+
+      const body = typeof result.body === 'object' && result.body !== null ? (result.body as Record<string, unknown>) : null;
+      const sha = body?.['sha'];
+      if (typeof sha !== 'string') return failure('malformed', 'response was missing sha');
+
+      return { ok: true, sha };
+    },
+
+    async createBranch(installationId: number, owner: string, repo: string, branch: string, sha: string): Promise<CreateBranchResult> {
+      const issued = await tokenIssuer.getInstallationToken(installationId);
+      if (!issued.ok) return issued;
+
+      const url = `${baseUrl}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/refs`;
+      const payload = { ref: `refs/heads/${branch}`, sha };
+      const result = await request(url, `Bearer ${issued.token}`, { method: 'POST', body: payload });
+      if (!('status' in result)) return result;
+
+      if (result.status === 422) {
+        return failure('ref_already_exists', responseErrorMessage(result) ?? `branch '${branch}' already exists on ${owner}/${repo}`);
+      }
+      const commonFailure = commonStatusFailure(result, [201]);
+      if (commonFailure !== null) return commonFailure;
+
+      return { ok: true };
+    },
+
+    async createPullRequest(
+      installationId: number,
+      owner: string,
+      repo: string,
+      input: { readonly title: string; readonly body: string; readonly head: string; readonly base: string },
+    ): Promise<CreatePullRequestResult> {
+      const issued = await tokenIssuer.getInstallationToken(installationId);
+      if (!issued.ok) return issued;
+
+      const url = `${baseUrl}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls`;
+      const payload = { title: input.title, body: input.body, head: input.head, base: input.base };
+      const result = await request(url, `Bearer ${issued.token}`, { method: 'POST', body: payload });
+      if (!('status' in result)) return result;
+
+      if (result.status === 422) {
+        return failure(
+          'pull_request_already_exists',
+          responseErrorMessage(result) ?? `a pull request already exists for ${input.head} -> ${input.base} on ${owner}/${repo}`,
+        );
+      }
+      const commonFailure = commonStatusFailure(result, [201]);
+      if (commonFailure !== null) return commonFailure;
+
+      const responseBody = typeof result.body === 'object' && result.body !== null ? (result.body as Record<string, unknown>) : null;
+      const number = responseBody?.['number'];
+      const htmlUrl = responseBody?.['html_url'];
+      const state = responseBody?.['state'];
+      if (typeof number !== 'number' || typeof htmlUrl !== 'string' || typeof state !== 'string') {
+        return failure('malformed', 'response was missing number, html_url, or state');
+      }
+
+      return { ok: true, number, htmlUrl, state };
+    },
+
+    async findPullRequestForBranch(
+      installationId: number,
+      owner: string,
+      repo: string,
+      head: string,
+      base: string,
+    ): Promise<FindPullRequestResult> {
+      const issued = await tokenIssuer.getInstallationToken(installationId);
+      if (!issued.ok) return issued;
+
+      const url = `${baseUrl}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls?head=${encodeURIComponent(`${owner}:${head}`)}&base=${encodeURIComponent(base)}&state=open`;
+      const result = await request(url, `Bearer ${issued.token}`);
+      if (!('status' in result)) return result;
+
+      const commonFailure = commonStatusFailure(result);
+      if (commonFailure !== null) return commonFailure;
+
+      if (!Array.isArray(result.body)) return failure('malformed', 'response was not an array');
+      if (result.body.length === 0) return { ok: true, pullRequest: null };
+
+      const first = result.body[0] as Record<string, unknown>;
+      const number = first['number'];
+      const htmlUrl = first['html_url'];
+      const state = first['state'];
+      if (typeof number !== 'number' || typeof htmlUrl !== 'string' || typeof state !== 'string') {
+        return failure('malformed', 'response entry was missing number, html_url, or state');
+      }
+
+      return { ok: true, pullRequest: { number, htmlUrl, state } };
+    },
+
+    async getPullRequest(installationId: number, owner: string, repo: string, number: number): Promise<GetPullRequestResult> {
+      const issued = await tokenIssuer.getInstallationToken(installationId);
+      if (!issued.ok) return issued;
+
+      const url = `${baseUrl}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${encodeURIComponent(String(number))}`;
+      const result = await request(url, `Bearer ${issued.token}`);
+      if (!('status' in result)) return result;
+
+      if (result.status === 404) {
+        return failure('file_not_found', `no pull request #${number} on ${owner}/${repo}`);
+      }
+      const commonFailure = commonStatusFailure(result);
+      if (commonFailure !== null) return commonFailure;
+
+      const body = typeof result.body === 'object' && result.body !== null ? (result.body as Record<string, unknown>) : null;
+      const prNumber = body?.['number'];
+      const htmlUrl = body?.['html_url'];
+      const state = body?.['state'];
+      const merged = body?.['merged'];
+      const mergeCommitSha = body?.['merge_commit_sha'];
+      const head = typeof body?.['head'] === 'object' && body['head'] !== null ? (body['head'] as Record<string, unknown>) : null;
+      const base = typeof body?.['base'] === 'object' && body['base'] !== null ? (body['base'] as Record<string, unknown>) : null;
+      const headRef = head?.['ref'];
+      const baseRef = base?.['ref'];
+
+      if (
+        typeof prNumber !== 'number' ||
+        typeof htmlUrl !== 'string' ||
+        typeof state !== 'string' ||
+        typeof merged !== 'boolean' ||
+        typeof headRef !== 'string' ||
+        typeof baseRef !== 'string'
+      ) {
+        return failure('malformed', 'response was missing number, html_url, state, merged, head.ref, or base.ref');
+      }
+
+      return {
+        ok: true,
+        number: prNumber,
+        htmlUrl,
+        state,
+        merged,
+        mergeCommitSha: typeof mergeCommitSha === 'string' ? mergeCommitSha : null,
+        headRef,
+        baseRef,
+      };
     },
   };
 }

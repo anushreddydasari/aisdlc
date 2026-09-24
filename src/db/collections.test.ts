@@ -12,6 +12,10 @@ import {
   COLLECTION_OPTIONS,
   INDEXES,
   APPROVAL_REQUIRES_OPERATOR_CLAUSE,
+  CHANGE_EXECUTION_STATUSES,
+  CHANGE_EXECUTION_VALIDATOR,
+  CHANGE_REVIEW_STATUSES,
+  CHANGE_REVIEW_VALIDATOR,
   INTAKE_ITEM_SCHEMA,
   INTAKE_ITEM_VALIDATOR,
   INTAKE_SOURCES,
@@ -40,7 +44,11 @@ import {
 /** The approved design. A rename or omission must fail loudly here. */
 const APPROVED_COLLECTIONS = [
   'auditLog',
+  'changeExecutions',
+  'changeReviews',
   'checkpoints',
+  'deployments',
+  'githubPublications',
   'intakeItems',
   'outboundWrites',
   'repositoryRegistry',
@@ -133,6 +141,15 @@ describe('index definitions', () => {
       // Each run selects at most one repository, ever.
       'repositorySelections.runId_unique',
       'webhookDeliveries.deliveryId_unique',
+      // Approving/re-approving the same proposal content twice must not
+      // create a second review row — a regenerated proposal is a new hash.
+      'changeReviews.proposalHash_unique',
+      // At most one execution attempt is recorded per approved review.
+      'changeExecutions.reviewId_unique',
+      // A given approved execution is published at most once, ever.
+      'githubPublications.executionId_unique',
+      // A given publication's merge outcome is recorded at most once, ever.
+      'deployments.publicationId_unique',
     ].sort());
   });
 
@@ -657,10 +674,14 @@ describe('repositorySelections validator', () => {
 });
 
 describe('collection options coverage', () => {
-  it('validates exactly the nine collections with enforced vocabularies', () => {
+  it('validates exactly the thirteen collections with enforced vocabularies', () => {
     assert.deepEqual(Object.keys(COLLECTION_OPTIONS).sort(), [
       'auditLog',
+      'changeExecutions',
+      'changeReviews',
       'checkpoints',
+      'deployments',
+      'githubPublications',
       'intakeItems',
       'outboundWrites',
       'repositoryRegistry',

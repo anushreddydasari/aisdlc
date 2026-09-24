@@ -383,10 +383,41 @@ export function resolveRuntimeMongoUri(
 export const NEUTARA_BASE_URL_VARIABLE = 'NEUTARA_API_BASE_URL';
 export const NEUTARA_TOKEN_VARIABLE = 'NEUTARA_API_TOKEN';
 
+/**
+ * 'mock' when `NEUTARA_API_BASE_URL` names a loopback host (the local
+ * `npm run mock:neutara` stand-in, or a synthetic test double); 'real' for
+ * anything else (a genuine Neutara test/staging/production origin).
+ *
+ * Purely a STARTUP-VISIBILITY classification, never a security boundary and
+ * never a behavior switch: `createNeutaraClient`/`enrichDelivery` treat both
+ * identically — same request shape, same validation, same retry rules. The
+ * only thing this changes is what the running service reports about ITSELF
+ * at startup (see `describeNeutaraStartup`), so an operator can immediately
+ * tell which mode a running instance is in without reading `.env`.
+ */
+export type NeutaraMode = 'mock' | 'real';
+
+/** Same loopback set `scripts/send-test-webhook.ts` already guards on, for the same reason: these hostnames are never a real Neutara origin. */
+const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1']);
+
+export function classifyNeutaraMode(baseUrl: string): NeutaraMode {
+  let hostname: string;
+  try {
+    hostname = new URL(baseUrl).hostname;
+  } catch {
+    // Already validated by normalizeNeutaraBaseUrl by the time this runs in
+    // practice; an unparseable value here is treated as 'real' rather than
+    // guessed at, matching this module's "never guess" posture elsewhere.
+    return 'real';
+  }
+  return LOOPBACK_HOSTNAMES.has(hostname.toLowerCase()) ? 'mock' : 'real';
+}
+
 export interface NeutaraConfig {
   /** Origin only, no trailing slash. The client appends `/api/issues/{key}`. */
   readonly baseUrl: string;
   readonly token: string;
+  readonly mode: NeutaraMode;
 }
 
 export type NeutaraConfigResult =
@@ -451,7 +482,39 @@ export function loadNeutaraConfig(source: EnvSource): NeutaraConfigResult {
   const normalized = normalizeNeutaraBaseUrl(rawBaseUrl!);
   if (!normalized.ok) return { configured: false, reason: normalized.reason };
 
-  return { configured: true, config: { baseUrl: normalized.baseUrl, token: token! } };
+  return {
+    configured: true,
+    config: { baseUrl: normalized.baseUrl, token: token!, mode: classifyNeutaraMode(normalized.baseUrl) },
+  };
+}
+
+export interface NeutaraStartupReport {
+  readonly configured: boolean;
+  readonly mode: NeutaraMode | null;
+  /** Safe to pass verbatim as a log message: never a token or base URL value. */
+  readonly message: string;
+}
+
+/**
+ * Turns a `NeutaraConfigResult` into exactly what startup should report —
+ * mock mode, real mode, or the missing configuration's variable names — as
+ * a PURE function, so "startup clearly reports its mode" is directly
+ * testable without running the service. Deliberately carries no `baseUrl`
+ * or `token` field: `SECRET_KEY_PATTERN` in logging/logger.ts would redact
+ * a field literally named `baseUrl` anyway (it matches `url`), but this
+ * function does not rely on that safety net — it simply never puts the
+ * value in the report to begin with.
+ */
+export function describeNeutaraStartup(result: NeutaraConfigResult): NeutaraStartupReport {
+  if (!result.configured) {
+    return { configured: false, mode: null, message: `neutara integration disabled: ${result.reason}` };
+  }
+  const { mode } = result.config;
+  const message =
+    mode === 'mock'
+      ? 'neutara integration enabled in MOCK mode (NEUTARA_API_BASE_URL is a loopback host — only a local mock/test double is reachable; real Neutara tickets will not be found)'
+      : 'neutara integration enabled in REAL mode (NEUTARA_API_BASE_URL is a non-loopback host)';
+  return { configured: true, mode, message };
 }
 
 export const OPENAI_API_KEY_VARIABLE = 'OPENAI_API_KEY';

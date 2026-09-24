@@ -3,7 +3,7 @@ import { describe, it } from 'node:test';
 
 import { isRetryable, type GitHubAccessFailureKind } from './client.ts';
 
-const RETRYABLE: readonly GitHubAccessFailureKind[] = ['rate_limited', 'transient'];
+const RETRYABLE: readonly GitHubAccessFailureKind[] = ['rate_limited', 'transient', 'timeout'];
 
 const NOT_RETRYABLE: readonly GitHubAccessFailureKind[] = [
   'selection_not_confirmed',
@@ -14,9 +14,12 @@ const NOT_RETRYABLE: readonly GitHubAccessFailureKind[] = [
   'installation_not_found',
   'branch_not_found',
   'file_not_found',
+  'authentication_failed',
   'insufficient_permission',
   'malformed',
   'unexpected_redirect',
+  'ref_already_exists',
+  'pull_request_already_exists',
 ];
 
 describe('isRetryable', () => {

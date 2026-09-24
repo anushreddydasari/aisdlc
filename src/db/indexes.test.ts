@@ -287,7 +287,11 @@ describe('initializeDatabase', () => {
 
     assert.deepEqual([...recorded.collModded].sort(), [
       'auditLog',
+      'changeExecutions',
+      'changeReviews',
       'checkpoints',
+      'deployments',
+      'githubPublications',
       'intakeItems',
       'outboundWrites',
       'repositoryRegistry',
@@ -305,7 +309,11 @@ describe('initializeDatabase', () => {
     assert.deepEqual(recorded.collModded, []);
     for (const name of [
       'auditLog',
+      'changeExecutions',
+      'changeReviews',
       'checkpoints',
+      'deployments',
+      'githubPublications',
       'outboundWrites',
       'intakeItems',
       'repositoryRegistry',

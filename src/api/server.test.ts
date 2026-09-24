@@ -357,8 +357,10 @@ describe('/repository-registry routing', () => {
     // Falls through to the generic "POST anywhere unmatched" case, same as
     // the /intake sibling test above: 405, not 404 (404 is reserved for a
     // GET/HEAD to an unknown path).
+    // (`/delete` is a real, test-mode-only route now — see registry-delete.ts —
+    // so this uses a segment that matches nothing.)
     const { url } = await withRegistry(true);
-    const res = await fetch(`${url}/repository-registry/abc123/delete`, { method: 'POST' });
+    const res = await fetch(`${url}/repository-registry/abc123/archive`, { method: 'POST' });
     assert.equal(res.status, 405);
   });
 
@@ -367,6 +369,43 @@ describe('/repository-registry routing', () => {
     assert.equal((await fetch(`${url}/health`)).status, 200);
     assert.equal((await fetch(`${url}/ingest`, { method: 'POST', body: '{}' })).status, 404);
     assert.equal((await fetch(`${url}/intake/CF-1/approve`, { method: 'POST', body: '{}' })).status, 404);
+  });
+});
+
+describe('/repositories admin UI routing', () => {
+  it('serves the admin page at GET /repositories, with no deps required', async () => {
+    const { url } = await start();
+    const res = await fetch(`${url}/repositories`);
+
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('content-type'), 'text/html; charset=utf-8');
+    assert.equal(res.headers.get('cache-control'), 'no-store');
+    const body = await res.text();
+    assert.ok(body.includes('<title>Repository Management</title>'));
+    assert.ok(body.includes('+ Add Repository'));
+  });
+
+  it('never embeds an OPERATOR_TOKEN, GitHub token, or private key in the served page', async () => {
+    // The page has no server-side deps and is rendered from a static
+    // constant, so this can never vary by request — but it's still worth
+    // asserting directly, since this is the one HTTP response an admin's
+    // browser actually receives.
+    const { url } = await start();
+    const body = await (await fetch(`${url}/repositories`)).text();
+    assert.ok(!body.includes('BEGIN PRIVATE KEY'));
+    assert.ok(!body.toLowerCase().includes('op_test_token'));
+  });
+
+  it('allows HEAD on the admin page', async () => {
+    const { url } = await start();
+    const res = await fetch(`${url}/repositories`, { method: 'HEAD' });
+    assert.equal(res.status, 200);
+  });
+
+  it('refuses POST on the admin page — it is read-only, static content', async () => {
+    const { url } = await start();
+    const res = await fetch(`${url}/repositories`, { method: 'POST' });
+    assert.equal(res.status, 405);
   });
 });
 
@@ -426,6 +465,83 @@ describe('/repository-selections routing', () => {
     const { url } = await withSelection(true);
     assert.equal((await fetch(`${url}/health`)).status, 200);
     assert.equal((await fetch(`${url}/repository-registry`)).status, 404);
+  });
+});
+
+describe('/runs/:runId/deployment routing', () => {
+  async function withDeploymentStatus(mounted: boolean): Promise<{ url: string }> {
+    const deps: ServerDeps = {
+      logger: createLogger({ write: () => {} }),
+      health: { version: '0.1.0', uptimeSeconds: () => 1, database: undefined },
+      ...(mounted
+        ? {
+            deploymentStatus: {
+              logger: createLogger({ write: () => {} }),
+              operatorToken: undefined,
+              runs: undefined,
+              reviews: undefined,
+              executions: undefined,
+              publications: undefined,
+              deployments: undefined,
+            },
+          }
+        : {}),
+    };
+    const server = createHttpServer(deps);
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address() as AddressInfo;
+    return { url: `http://127.0.0.1:${port}` };
+  }
+
+  it('routes GET /runs/:runId/deployment to the handler', async () => {
+    const { url } = await withDeploymentStatus(true);
+    const res = await fetch(`${url}/runs/abc123/deployment`);
+    // No operator token configured, so the handler answers 401 — which
+    // proves the request reached it rather than the 405 or 404 paths.
+    assert.equal(res.status, 401);
+  });
+
+  it('returns 404 when the deployment status route is not mounted', async () => {
+    const { url } = await withDeploymentStatus(false);
+    const res = await fetch(`${url}/runs/abc123/deployment`);
+    assert.equal(res.status, 404);
+  });
+
+  // Security (Section 16/23): this surface is read-only. There is no
+  // merge-trigger, approve, or deploy-trigger endpoint anywhere on this
+  // path — POST (or any other write method) to it is always refused.
+  it('refuses POST, PATCH, and DELETE on the deployment status route', async () => {
+    const { url } = await withDeploymentStatus(true);
+    for (const method of ['POST', 'PATCH', 'DELETE']) {
+      const res = await fetch(`${url}/runs/abc123/deployment`, { method });
+      assert.equal(res.status, 405, `${method} /runs/:runId/deployment was not refused`);
+    }
+  });
+
+  // No such endpoint exists anywhere: not /merge, not /approve-pr, not
+  // /auto-deploy, not /deploy — Section 16 forbids all four explicitly.
+  it('has no merge, approve-pr, auto-deploy, or deploy-trigger endpoint', async () => {
+    const { url } = await withDeploymentStatus(true);
+    for (const path of [
+      '/runs/abc123/merge',
+      '/runs/abc123/approve-pr',
+      '/runs/abc123/auto-deploy',
+      '/runs/abc123/deploy',
+      '/merge',
+      '/approve-pr',
+      '/auto-deploy',
+    ]) {
+      const res = await fetch(`${url}${path}`, { method: 'POST' });
+      assert.notEqual(res.status, 200, `${path} unexpectedly succeeded`);
+      assert.ok([404, 405].includes(res.status), `${path} returned an unexpected status ${res.status}`);
+    }
+  });
+
+  it('leaves /health and /runs/:runId untouched', async () => {
+    const { url } = await withDeploymentStatus(true);
+    assert.equal((await fetch(`${url}/health`)).status, 200);
+    assert.equal((await fetch(`${url}/runs/abc123`)).status, 404);
   });
 });
 

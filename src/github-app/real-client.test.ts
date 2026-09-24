@@ -89,11 +89,11 @@ describe('resolveInstallation', () => {
     assert.equal(result.ok === false && result.kind, 'installation_not_found');
   });
 
-  it('maps 401 to insufficient_permission', async () => {
+  it('maps 401 to authentication_failed', async () => {
     const h = harness(() => fakeResponse(401));
     const result = await h.client.resolveInstallation('cloudfuze', 'aisdlc-service');
     assert.equal(result.ok, false);
-    assert.equal(result.ok === false && result.kind, 'insufficient_permission');
+    assert.equal(result.ok === false && result.kind, 'authentication_failed');
   });
 
   it('maps a response missing an installation id to malformed', async () => {
@@ -354,7 +354,7 @@ describe('error classification shared across all three methods', () => {
         assert.equal(result.kind, 'transient');
       });
 
-      it('classifies a timeout as transient', async () => {
+      it('classifies a timeout as the dedicated timeout kind, distinct from transient', async () => {
         const fetchFn = (async (input: string | URL | Request, init?: RequestInit) => {
           if (String(input).endsWith('/access_tokens')) return tokenExchangeResponse();
           return new Promise<Response>((_resolve, reject) => {
@@ -374,7 +374,7 @@ describe('error classification shared across all three methods', () => {
         });
         const result = await run({ client, calls: [], logs: [] });
         assert.equal(result.ok, false);
-        assert.equal(result.kind, 'transient');
+        assert.equal(result.kind, 'timeout');
       });
 
       it('rejects a redirect rather than following it', async () => {
@@ -405,6 +405,413 @@ describe('error classification shared across all three methods', () => {
 
     await client.resolveInstallation('cloudfuze', 'aisdlc-service');
     for (const init of seenInit) assert.equal(init.redirect, 'error');
+  });
+});
+
+describe('getRef', () => {
+  it('returns the sha a branch currently points at', async () => {
+    const h = harness(() => fakeResponse(200, { ref: 'refs/heads/main', object: { type: 'commit', sha: 'abc123' } }));
+    const result = await h.client.getRef(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', 'main');
+    assert.deepEqual(result, { ok: true, sha: 'abc123' });
+    assert.ok(h.calls.some((c) => c.url.endsWith('/git/ref/heads/main')));
+  });
+
+  it('url-encodes a branch name containing slashes without escaping the separators', async () => {
+    const h = harness(() => fakeResponse(200, { object: { sha: 'abc123' } }));
+    await h.client.getRef(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', 'aisdlc/run-1/exec-1');
+    assert.ok(h.calls.some((c) => c.url.endsWith('/git/ref/heads/aisdlc/run-1/exec-1')));
+  });
+
+  it('maps a missing branch to branch_not_found', async () => {
+    const h = harness(() => fakeResponse(404, { message: 'Not Found' }));
+    const result = await h.client.getRef(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', 'no-such-branch');
+    assert.equal(result.ok, false);
+    assert.equal(result.ok === false && result.kind, 'branch_not_found');
+  });
+
+  it('maps a response missing object.sha to malformed', async () => {
+    const h = harness(() => fakeResponse(200, { unexpected: 'shape' }));
+    const result = await h.client.getRef(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', 'main');
+    assert.equal(result.ok, false);
+    assert.equal(result.ok === false && result.kind, 'malformed');
+  });
+});
+
+describe('getCommit', () => {
+  it("returns a commit's tree sha", async () => {
+    const h = harness(() => fakeResponse(200, { sha: 'abc123', tree: { sha: 'tree456' } }));
+    const result = await h.client.getCommit(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', 'abc123');
+    assert.deepEqual(result, { ok: true, treeSha: 'tree456' });
+  });
+
+  it('maps a missing commit to malformed', async () => {
+    const h = harness(() => fakeResponse(404, { message: 'Not Found' }));
+    const result = await h.client.getCommit(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', 'does-not-exist');
+    assert.equal(result.ok, false);
+    assert.equal(result.ok === false && result.kind, 'malformed');
+  });
+});
+
+describe('createTree', () => {
+  it('posts the base tree and file entries, returning the new tree sha', async () => {
+    let sentBody: unknown;
+    // Capture the body via a dedicated fetchFn, since `harness` only exposes the URL to `respond`.
+    const fetchFn = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith('/access_tokens')) return fakeResponse(201, { token: 'ghs_fake', expires_at: '2026-09-22T01:00:00Z' });
+      if (typeof init?.body === 'string') sentBody = JSON.parse(init.body);
+      return fakeResponse(201, { sha: 'tree789' });
+    }) as typeof fetch;
+    const logger = createLogger({ write: () => {} });
+    const tokenIssuer = createTokenIssuer({ appId: APP_ID, privateKey, logger, fetchFn, now: () => NOW });
+    const client = createRealGitHubAppClient({ appId: APP_ID, privateKey, tokenIssuer, logger, fetchFn, now: () => NOW });
+
+    const result = await client.createTree(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', 'base-tree-sha', [
+      { path: 'README.md', content: '# updated' },
+    ]);
+
+    assert.deepEqual(result, { ok: true, sha: 'tree789' });
+    assert.deepEqual(sentBody, {
+      base_tree: 'base-tree-sha',
+      tree: [{ path: 'README.md', mode: '100644', type: 'blob', content: '# updated' }],
+    });
+  });
+
+  it('maps a response missing sha to malformed', async () => {
+    const h = harness(() => fakeResponse(201, {}));
+    const result = await h.client.createTree(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', 'base', []);
+    assert.equal(result.ok, false);
+    assert.equal(result.ok === false && result.kind, 'malformed');
+  });
+});
+
+describe('createCommit', () => {
+  it('posts message, tree, and parents, returning the new commit sha', async () => {
+    let sentBody: unknown;
+    const fetchFn = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith('/access_tokens')) return fakeResponse(201, { token: 'ghs_fake', expires_at: '2026-09-22T01:00:00Z' });
+      if (typeof init?.body === 'string') sentBody = JSON.parse(init.body);
+      return fakeResponse(201, { sha: 'commit789' });
+    }) as typeof fetch;
+    const logger = createLogger({ write: () => {} });
+    const tokenIssuer = createTokenIssuer({ appId: APP_ID, privateKey, logger, fetchFn, now: () => NOW });
+    const client = createRealGitHubAppClient({ appId: APP_ID, privateKey, tokenIssuer, logger, fetchFn, now: () => NOW });
+
+    const result = await client.createCommit(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', 'AISDLC: update README', 'tree789', [
+      'base-commit-sha',
+    ]);
+
+    assert.deepEqual(result, { ok: true, sha: 'commit789' });
+    assert.deepEqual(sentBody, { message: 'AISDLC: update README', tree: 'tree789', parents: ['base-commit-sha'] });
+  });
+});
+
+describe('createBranch', () => {
+  it('creates a new ref and reports success with no body to interpret', async () => {
+    const h = harness(() => fakeResponse(201, { ref: 'refs/heads/aisdlc/run-1/exec-1' }));
+    const result = await h.client.createBranch(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', 'aisdlc/run-1/exec-1', 'commit789');
+    assert.deepEqual(result, { ok: true });
+  });
+
+  it('maps a 422 to ref_already_exists, never overwriting the existing ref', async () => {
+    const h = harness(() => fakeResponse(422, { message: 'Reference already exists' }));
+    const result = await h.client.createBranch(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', 'aisdlc/run-1/exec-1', 'commit789');
+    assert.equal(result.ok, false);
+    assert.equal(result.ok === false && result.kind, 'ref_already_exists');
+    assert.match((result.ok === false && result.message) || '', /already exists/);
+  });
+
+  it('posts exactly the requested branch name and sha — the base branch is never named in the request', async () => {
+    let sentBody: unknown;
+    const fetchFn = (async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith('/access_tokens')) return tokenExchangeResponse();
+      if (typeof init?.body === 'string') sentBody = JSON.parse(init.body);
+      return fakeResponse(201, {});
+    }) as typeof fetch;
+    const logger = createLogger({ write: () => {} });
+    const tokenIssuer = createTokenIssuer({ appId: APP_ID, privateKey, logger, fetchFn, now: () => NOW });
+    const client = createRealGitHubAppClient({ appId: APP_ID, privateKey, tokenIssuer, logger, fetchFn, now: () => NOW });
+
+    await client.createBranch(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', 'aisdlc/run-1/exec-1', 'commit789');
+
+    assert.deepEqual(sentBody, { ref: 'refs/heads/aisdlc/run-1/exec-1', sha: 'commit789' });
+  });
+});
+
+describe('createPullRequest', () => {
+  it('creates a pull request and returns its number, url, and state', async () => {
+    const h = harness(() => fakeResponse(201, { number: 42, html_url: 'https://github.com/cloudfuze/aisdlc-service/pull/42', state: 'open' }));
+    const result = await h.client.createPullRequest(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', {
+      title: 'AISDLC: update README',
+      body: 'Approved via AISDLC.',
+      head: 'aisdlc/run-1/exec-1',
+      base: 'main',
+    });
+    assert.deepEqual(result, { ok: true, number: 42, htmlUrl: 'https://github.com/cloudfuze/aisdlc-service/pull/42', state: 'open' });
+  });
+
+  it('maps a 422 to pull_request_already_exists rather than a generic failure', async () => {
+    const h = harness(() => fakeResponse(422, { message: 'A pull request already exists for cloudfuze:aisdlc/run-1/exec-1.' }));
+    const result = await h.client.createPullRequest(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', {
+      title: 't',
+      body: 'b',
+      head: 'aisdlc/run-1/exec-1',
+      base: 'main',
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.ok === false && result.kind, 'pull_request_already_exists');
+  });
+
+  it('maps a response missing number/html_url/state to malformed', async () => {
+    const h = harness(() => fakeResponse(201, { unexpected: 'shape' }));
+    const result = await h.client.createPullRequest(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', {
+      title: 't',
+      body: 'b',
+      head: 'aisdlc/run-1/exec-1',
+      base: 'main',
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.ok === false && result.kind, 'malformed');
+  });
+});
+
+describe('findPullRequestForBranch', () => {
+  it('returns the open pull request for a head/base pair', async () => {
+    const h = harness(() =>
+      fakeResponse(200, [{ number: 42, html_url: 'https://github.com/cloudfuze/aisdlc-service/pull/42', state: 'open' }]),
+    );
+    const result = await h.client.findPullRequestForBranch(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', 'aisdlc/run-1/exec-1', 'main');
+    assert.deepEqual(result, {
+      ok: true,
+      pullRequest: { number: 42, htmlUrl: 'https://github.com/cloudfuze/aisdlc-service/pull/42', state: 'open' },
+    });
+  });
+
+  it('returns null when no pull request is open for that pair', async () => {
+    const h = harness(() => fakeResponse(200, []));
+    const result = await h.client.findPullRequestForBranch(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', 'aisdlc/run-1/exec-1', 'main');
+    assert.deepEqual(result, { ok: true, pullRequest: null });
+  });
+});
+
+describe('getPullRequest (PR merge detection)', () => {
+  it('reports an open, unmerged PR', async () => {
+    const h = harness(() =>
+      fakeResponse(200, {
+        number: 7,
+        html_url: 'https://github.com/cloudfuze/aisdlc-service/pull/7',
+        state: 'open',
+        merged: false,
+        merge_commit_sha: null,
+        head: { ref: 'aisdlc/run-1/exec-1' },
+        base: { ref: 'main' },
+      }),
+    );
+    const result = await h.client.getPullRequest(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', 7);
+    assert.deepEqual(result, {
+      ok: true,
+      number: 7,
+      htmlUrl: 'https://github.com/cloudfuze/aisdlc-service/pull/7',
+      state: 'open',
+      merged: false,
+      mergeCommitSha: null,
+      headRef: 'aisdlc/run-1/exec-1',
+      baseRef: 'main',
+    });
+  });
+
+  it('reports a merged PR with its merge commit sha', async () => {
+    const h = harness(() =>
+      fakeResponse(200, {
+        number: 8,
+        html_url: 'https://github.com/cloudfuze/aisdlc-service/pull/8',
+        state: 'closed',
+        merged: true,
+        merge_commit_sha: 'deadbeefcafe',
+        head: { ref: 'aisdlc/run-2/exec-2' },
+        base: { ref: 'main' },
+      }),
+    );
+    const result = await h.client.getPullRequest(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', 8);
+    assert.ok(result.ok);
+    assert.equal(result.merged, true);
+    assert.equal(result.mergeCommitSha, 'deadbeefcafe');
+  });
+
+  it('reports a closed, unmerged PR — never conflating closed with merged', async () => {
+    const h = harness(() =>
+      fakeResponse(200, {
+        number: 9,
+        html_url: 'https://github.com/cloudfuze/aisdlc-service/pull/9',
+        state: 'closed',
+        merged: false,
+        merge_commit_sha: null,
+        head: { ref: 'aisdlc/run-3/exec-3' },
+        base: { ref: 'main' },
+      }),
+    );
+    const result = await h.client.getPullRequest(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', 9);
+    assert.ok(result.ok);
+    assert.equal(result.state, 'closed');
+    assert.equal(result.merged, false);
+  });
+
+  it('maps a 404 to file_not_found', async () => {
+    const h = harness(() => fakeResponse(404, { message: 'Not Found' }));
+    const result = await h.client.getPullRequest(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', 999);
+    assert.equal(result.ok, false);
+    assert.equal(result.ok === false && result.kind, 'file_not_found');
+  });
+
+  it('maps a response missing merged/head.ref/base.ref to malformed', async () => {
+    const h = harness(() => fakeResponse(200, { number: 7, html_url: 'x', state: 'open' }));
+    const result = await h.client.getPullRequest(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', 7);
+    assert.equal(result.ok, false);
+    assert.equal(result.ok === false && result.kind, 'malformed');
+  });
+
+  it('classifies a 429 as rate_limited', async () => {
+    const h = harness(() => fakeResponse(429));
+    const result = await h.client.getPullRequest(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', 7);
+    assert.equal(result.ok, false);
+    assert.equal(result.ok === false && result.kind, 'rate_limited');
+  });
+
+  it('classifies a 5xx as retryable transient', async () => {
+    const h = harness(() => fakeResponse(503));
+    const result = await h.client.getPullRequest(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', 7);
+    assert.equal(result.ok, false);
+    assert.equal(result.ok === false && result.kind, 'transient');
+  });
+});
+
+describe('write-method status classification (shared with the read methods)', () => {
+  const writeCalls: { name: string; run: (h: Harness) => Promise<{ ok: boolean; kind?: string }> }[] = [
+    { name: 'getRef', run: (h) => h.client.getRef(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', 'main') as Promise<{ ok: boolean; kind?: string }> },
+    {
+      name: 'createTree',
+      run: (h) =>
+        h.client.createTree(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', 'base', []) as Promise<{ ok: boolean; kind?: string }>,
+    },
+    {
+      name: 'createBranch',
+      run: (h) =>
+        h.client.createBranch(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', 'aisdlc/run-1/exec-1', 'sha') as Promise<{
+          ok: boolean;
+          kind?: string;
+        }>,
+    },
+    {
+      name: 'createPullRequest',
+      run: (h) =>
+        h.client.createPullRequest(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', {
+          title: 't',
+          body: 'b',
+          head: 'aisdlc/run-1/exec-1',
+          base: 'main',
+        }) as Promise<{ ok: boolean; kind?: string }>,
+    },
+  ];
+
+  for (const { name, run } of writeCalls) {
+    describe(name, () => {
+      it('maps 401 to authentication_failed', async () => {
+        const h = harness(() => fakeResponse(401));
+        const result = await run(h);
+        assert.equal(result.ok, false);
+        assert.equal(result.kind, 'authentication_failed');
+      });
+
+      it('classifies a 429 as rate_limited', async () => {
+        const h = harness(() => fakeResponse(429));
+        const result = await run(h);
+        assert.equal(result.ok, false);
+        assert.equal(result.kind, 'rate_limited');
+      });
+
+      it('classifies a 5xx as retryable transient', async () => {
+        const h = harness(() => fakeResponse(503));
+        const result = await run(h);
+        assert.equal(result.ok, false);
+        assert.equal(result.kind, 'transient');
+      });
+
+      it('classifies a timeout distinctly from transient', async () => {
+        const fetchFn = (async (input: string | URL | Request, init?: RequestInit) => {
+          if (String(input).endsWith('/access_tokens')) return tokenExchangeResponse();
+          return new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+          });
+        }) as typeof fetch;
+        const logger = createLogger({ write: () => {} });
+        const tokenIssuer = createTokenIssuer({ appId: APP_ID, privateKey, logger, fetchFn, now: () => NOW });
+        const client = createRealGitHubAppClient({
+          appId: APP_ID,
+          privateKey,
+          tokenIssuer,
+          logger,
+          fetchFn,
+          now: () => NOW,
+          timeoutMs: 5,
+        });
+        const result = await run({ client, calls: [], logs: [] });
+        assert.equal(result.ok, false);
+        assert.equal(result.kind, 'timeout');
+      });
+
+      it('rejects a redirect rather than following it', async () => {
+        const fetchFn = (async (input: string | URL | Request) => {
+          if (String(input).endsWith('/access_tokens')) return tokenExchangeResponse();
+          throw new TypeError('fetch failed: unexpected redirect, redirect mode is set to error');
+        }) as typeof fetch;
+        const logger = createLogger({ write: () => {} });
+        const tokenIssuer = createTokenIssuer({ appId: APP_ID, privateKey, logger, fetchFn, now: () => NOW });
+        const client = createRealGitHubAppClient({ appId: APP_ID, privateKey, tokenIssuer, logger, fetchFn, now: () => NOW });
+        const result = await run({ client, calls: [], logs: [] });
+        assert.equal(result.ok, false);
+        assert.equal(result.kind, 'unexpected_redirect');
+      });
+    });
+  }
+
+  it('every write request also sets redirect: "error"', async () => {
+    // Excludes the token-exchange call: that request belongs to
+    // `token-issuer.ts`, a separately-tested module with its own security
+    // properties — this test only asserts on requests this client's own
+    // write methods make.
+    const seen: { url: string; init: RequestInit }[] = [];
+    const fetchFn = (async (input: string | URL | Request, init?: RequestInit) => {
+      seen.push({ url: String(input), init: init! });
+      if (String(input).endsWith('/access_tokens')) return tokenExchangeResponse();
+      return fakeResponse(201, { sha: 'abc' });
+    }) as typeof fetch;
+    const logger = createLogger({ write: () => {} });
+    const tokenIssuer = createTokenIssuer({ appId: APP_ID, privateKey, logger, fetchFn, now: () => NOW });
+    const client = createRealGitHubAppClient({ appId: APP_ID, privateKey, tokenIssuer, logger, fetchFn, now: () => NOW });
+
+    await client.createTree(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', 'base', []);
+    const writeCalls = seen.filter((c) => !c.url.endsWith('/access_tokens'));
+    assert.ok(writeCalls.length > 0);
+    for (const call of writeCalls) assert.equal(call.init.redirect, 'error');
+  });
+
+  it('sends the JSON body with a content-type header on every write request', async () => {
+    const seen: { url: string; init: RequestInit }[] = [];
+    const fetchFn = (async (input: string | URL | Request, init?: RequestInit) => {
+      seen.push({ url: String(input), init: init! });
+      if (String(input).endsWith('/access_tokens')) return tokenExchangeResponse();
+      return fakeResponse(201, { sha: 'abc' });
+    }) as typeof fetch;
+    const logger = createLogger({ write: () => {} });
+    const tokenIssuer = createTokenIssuer({ appId: APP_ID, privateKey, logger, fetchFn, now: () => NOW });
+    const client = createRealGitHubAppClient({ appId: APP_ID, privateKey, tokenIssuer, logger, fetchFn, now: () => NOW });
+
+    await client.createTree(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', 'base', [{ path: 'a.ts', content: 'x' }]);
+    const writeCall = seen.find((c) => !c.url.endsWith('/access_tokens'));
+    assert.ok(writeCall !== undefined);
+    assert.equal(writeCall.init.method, 'POST');
+    assert.equal((writeCall.init.headers as Record<string, string>)['content-type'], 'application/json');
   });
 });
 

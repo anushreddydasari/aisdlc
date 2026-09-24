@@ -156,6 +156,19 @@ All faults are reported at once, so a fresh checkout sees the full list rather
 than one variable per attempt. An empty or whitespace-only value counts as
 missing.
 
+### Neutara integration: mock vs real
+
+`NEUTARA_API_BASE_URL` alone switches enrichment between a local mock
+server (`npm run mock:neutara`, loopback host) and a real Neutara
+test/staging origin — no code change, no other variable, ever required.
+Startup logs which mode is active (`neutara integration enabled in
+MOCK/REAL mode`), never the base URL or token value. **Never switches
+automatically.** See
+[docs/neutara-integration-modes.md](docs/neutara-integration-modes.md) for
+the exact variables each mode needs and what switching does and does not
+do (in particular: it does not make this service reachable by a real
+Neutara webhook).
+
 ## Logging
 
 One JSON object per line on stdout. Every field is redacted on the way out:
@@ -176,9 +189,24 @@ src/
   api/health.ts        liveness and readiness payloads
   api/approval.ts      the human approval gate (approve/reject)
   api/operator-auth.ts bearer-token verification for the approval gate
+  api/run-status.ts     GET /runs/:runId — the composed end-to-end status view
+  api/coding-agent.ts    POST /runs/:runId/coding-agent — triggers the Coding Agent
+  api/change-review.ts   POST /change-reviews/:reviewId/approve|reject
   api/server.ts        node:http server and routing
   logging/logger.ts    structured JSON logging with redaction
   scripts/init-indexes.ts   one-off database setup (migration user)
+  repository-registry/  authorized project → GitHub repository mappings
+  api/repository-ui.ts  GET /repositories — static admin page for the Repository Registry (no new business logic)
+  repository-selection/ matches a run to a registry entry; human confirmation
+  requirements/queue.ts, requirements/scheduler.ts   runs the Requirements Agent for every received intake item
+  github-app/            GitHub App auth (JWT, installation tokens) + client
+  github-access/service.ts  validates a run and reads its confirmed repository's files
+  coding-agent/          analyzes requirements + repository content, proposes changes (read-only)
+  change-execution/      human review of proposed changes; applies ONLY approved changes to a local working copy, then validates
+  github-publish/        publishes an approved, executed, validated change: branch, commit, push, pull request (no merge)
+  deployment/            detects a human PR merge (read-only), then deployment + post-deployment validation behind a mock provider
+  api/deployment-status.ts  GET /runs/:runId/deployment — the detailed deployment record
+  pipeline/              wires everything above into one end-to-end workflow: run-status view, Coding Agent trigger, change-execution/publish/merge-detection/deployment queue workers
   index.ts             entrypoint
 ```
 
@@ -250,6 +278,96 @@ It is still not "the audit log cannot be altered by anyone" — an Atlas project
 owner can change roles or delete anything, and tampering is prevented rather
 than *detected* (decision D4). [docs/atlas-roles.md](docs/atlas-roles.md) has
 the live grants, the residual risks and the verification commands.
+
+## GitHub Access Integration
+
+Connects an approved, human-confirmed run to real repository content:
+validates the run/intake/selection chain, then authorizes and reads the
+confirmed repository via `github-app/`. **Read-only** — no write, branch,
+commit, or pull request exists anywhere in this codebase yet. See
+[docs/github-access-integration.md](docs/github-access-integration.md) for
+the full workflow, validation rules, error/retry categories, and audit
+events.
+
+## Coding Agent
+
+Consumes approved requirements and a confirmed repository's content (via
+GitHub Access Integration) and produces a structured implementation plan
+and proposed file changes for human review. **Read-only** — nothing here
+applies a change, creates a branch, or writes to GitHub. See
+[docs/coding-agent.md](docs/coding-agent.md) for the full architecture,
+input/output contracts, validation rules, error handling, and the
+human-review boundary.
+
+## Human Review → Approved Change Execution
+
+Takes the Coding Agent's proposed changes through a strict human-approval
+boundary and, only after explicit approval, applies them to a local,
+disposable working copy of the confirmed repository — then validates.
+**The Coding Agent must never automatically approve its own changes**;
+`ChangeReviewRepository.approve()` refuses any actor that is not a human
+operator. See [docs/change-execution.md](docs/change-execution.md) for the
+full review model, proposal-integrity guarantees, stale-file detection,
+execution safety, and audit events.
+
+## GitHub Write + Pull Request Workflow
+
+Takes a successfully executed, successfully validated, human-approved
+change and publishes it: a dedicated `aisdlc/<runId>/<executionId>`
+branch off the confirmed base branch, one commit containing exactly the
+approved changes, and a pull request. **Pull request merge remains
+human-controlled** — nothing in this codebase has a merge method.
+Re-verifies the repository/branch/file state live, immediately before
+publishing, and never targets the base branch. See
+[docs/github-publish.md](docs/github-publish.md) for the full security
+boundary, branch/commit/push behavior, idempotency, failure recovery, and
+audit events.
+
+## End-to-End Orchestration
+
+Wires every phase above into one controlled pipeline: ticket → requirements
+→ human approval → repository selection → human confirmation → Coding
+Agent → human change review → local execution → validation → GitHub
+branch/commit/push → pull request → **human merge**. Four human gates,
+never crossed automatically; `runs.status` is unchanged (five values) —
+the detailed stage a run is in is derived, not stored, from the
+collections each earlier phase already maintains. See
+[docs/end-to-end-orchestration.md](docs/end-to-end-orchestration.md) for
+the full lifecycle diagram, state derivation, worker responsibilities,
+idempotency, recovery, audit, and the security review.
+
+## Human PR Merge → Deployment → Post-Deployment Validation
+
+**Pull Request merge remains human-controlled. AISDLC detects the merge
+but does not perform the merge.** Once a human merges (or closes without
+merging) the pull request the previous phase opened, this phase takes
+over automatically: detects the merge (read-only), records a deployment as
+eligible, deploys it, and runs post-deployment validation — all behind a
+`DeploymentProvider` abstraction. **Deployment orchestration is
+implemented behind a provider abstraction; real production deployment
+remains disabled until the deployment environment is explicitly
+configured and verified** — this repository has no Dockerfile, CI/CD
+workflow, or cloud-platform configuration to build one from yet, so only a
+deterministic mock provider and mock post-deployment validator are wired
+up. See [docs/deployment.md](docs/deployment.md) for the full merge
+detection, deployment, and post-deployment validation model, idempotency,
+failure recovery, audit events, and the security review.
+
+## Repository Management Admin UI
+
+**The Repository Registry backend remains the authoritative source of
+repository configuration; this page is only an administrative interface to
+that existing system.** `GET /repositories` serves a single, self-contained
+HTML/CSS/JS admin page (no build step, no frontend framework) that lets an
+authorized administrator view, add, edit, and activate/deactivate
+repository registry entries — entirely by calling the pre-existing
+`/repository-registry` JSON API from the browser. No second source of
+truth, no new authorization mechanism, and no change to the existing
+repository selection safety rules (human confirmation, ambiguous-candidate
+handling, deactivated repositories being unselectable). See
+[docs/repository-management-ui.md](docs/repository-management-ui.md) for
+the full route/authorization/audit model and the offline end-to-end
+verification.
 
 ## Tests
 
