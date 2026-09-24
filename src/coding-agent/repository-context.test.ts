@@ -69,6 +69,9 @@ describe('buildRepositoryContext', () => {
       async accessRepositoryForRun() {
         return result;
       },
+      async listFilesForRun(): Promise<never> {
+        throw new Error('must not be called');
+      },
     };
   }
 
@@ -129,6 +132,9 @@ describe('buildRepositoryContext', () => {
         async accessRepositoryForRun() {
           called = true;
           return successResult();
+        },
+        async listFilesForRun(): Promise<never> {
+          throw new Error('must not be called');
         },
       },
       fileSelectionPolicy: { selectFiles: () => [] },

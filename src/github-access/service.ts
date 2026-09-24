@@ -52,8 +52,8 @@ import type { IntakeRepository } from '../intake/repository.ts';
 import type { RunDocument, RunsRepository } from '../orchestrator/repository.ts';
 import type { RepositoryRegistryRepository } from '../repository-registry/repository.ts';
 import type { RepositorySelectionRepository } from '../repository-selection/repository.ts';
-import { authorizeRepositoryAccess } from '../github-app/access.ts';
-import type { GitHubAccessFailureKind, GitHubAppClient } from '../github-app/client.ts';
+import { authorizeRepositoryAccess, type AuthorizedRepositoryAccess } from '../github-app/access.ts';
+import type { GitHubAccessFailureKind, GitHubAppClient, GitHubTreeFile } from '../github-app/client.ts';
 
 /** Recorded as every audit entry's actor. Never a human or another system component's identity. */
 export const GITHUB_ACCESS_SYSTEM_ACTOR = 'system:github-access';
@@ -215,7 +215,29 @@ export interface GitHubAccessService {
    * "duplicate access" discussion.
    */
   accessRepositoryForRun(runId: ObjectId, filePaths: readonly string[]): Promise<GitHubAccessResult>;
+  /**
+   * Lists every file on the run's confirmed branch — paths and sizes, never
+   * content — after exactly the same run / intake / selection / registry /
+   * installation checks as `accessRepositoryForRun`. What makes automatic
+   * file selection possible without letting it reach outside the confirmed
+   * repository and branch.
+   */
+  listFilesForRun(runId: ObjectId): Promise<GitHubFileListResult>;
 }
+
+export interface GitHubFileListSuccess {
+  readonly ok: true;
+  readonly runId: ObjectId;
+  readonly repositoryId: string;
+  readonly owner: string;
+  readonly repo: string;
+  readonly branch: string;
+  readonly files: readonly GitHubTreeFile[];
+  /** GitHub cut the list short (very large repository); the caller must not treat it as complete. */
+  readonly truncated: boolean;
+}
+
+export type GitHubFileListResult = GitHubFileListSuccess | GitHubAccessFailure;
 
 export function createGitHubAccessService(deps: GitHubAccessDeps): GitHubAccessService {
   const { runs, intake, selections, registry, client, audit, logger } = deps;
@@ -269,13 +291,34 @@ export function createGitHubAccessService(deps: GitHubAccessDeps): GitHubAccessS
       detail: { filePaths: [...filePaths] },
     });
 
+    const validated = await validateAndAuthorize(runId);
+    if (!validated.ok) return validated.failure;
+    const { theRun, selection, authorized } = validated;
+
+    return readFiles(runId, theRun, selection, authorized, filePaths);
+  }
+
+  /**
+   * Every check a run must pass before ANY GitHub read — run readiness,
+   * intake approval, a human-confirmed selection, and the live registry /
+   * installation / branch authorization. Shared by reading files and by
+   * listing them, so neither can skip a check the other performs.
+   */
+  async function validateAndAuthorize(
+    runId: ObjectId,
+  ): Promise<
+    | { ok: false; failure: GitHubAccessFailure }
+    | { ok: true; theRun: RunDocument; selection: NonNullable<Awaited<ReturnType<RepositorySelectionRepository['findByRunId']>>>; authorized: AuthorizedRepositoryAccess }
+  > {
+    const failed = async (...args: Parameters<typeof fail>) => ({ ok: false as const, failure: await fail(...args) });
+
     const theRun = await runs.findById(runId);
     if (theRun === null) {
-      return fail(runId, null, null, 'run_not_found', `no run '${runId.toHexString()}'`);
+      return failed(runId, null, null, 'run_not_found', `no run '${runId.toHexString()}'`);
     }
 
     if (!READY_RUN_STATUSES.includes(theRun.status)) {
-      return fail(
+      return failed(
         runId,
         theRun.intakeItemId,
         null,
@@ -289,7 +332,7 @@ export function createGitHubAccessService(deps: GitHubAccessDeps): GitHubAccessS
     // guard, not trusted blindly from the run document alone.
     const item = await intake.findByIssueKey(theRun.issueKey);
     if (item === null || item._id === undefined || !item._id.equals(theRun.intakeItemId)) {
-      return fail(
+      return failed(
         runId,
         theRun.intakeItemId,
         null,
@@ -298,15 +341,15 @@ export function createGitHubAccessService(deps: GitHubAccessDeps): GitHubAccessS
       );
     }
     if (item.status !== 'approved') {
-      return fail(runId, theRun.intakeItemId, null, 'intake_not_approved', `intake item status is '${item.status}'`);
+      return failed(runId, theRun.intakeItemId, null, 'intake_not_approved', `intake item status is '${item.status}'`);
     }
 
     const selection = await selections.findByRunId(runId);
     if (selection === null) {
-      return fail(runId, theRun.intakeItemId, null, 'selection_missing', 'no repository selection exists for this run');
+      return failed(runId, theRun.intakeItemId, null, 'selection_missing', 'no repository selection exists for this run');
     }
     if (selection.status !== 'selected' || selection.confirmedBy === null) {
-      return fail(
+      return failed(
         runId,
         theRun.intakeItemId,
         selection.selectedRepositoryId,
@@ -317,7 +360,7 @@ export function createGitHubAccessService(deps: GitHubAccessDeps): GitHubAccessS
 
     const authorized = await authorizeRepositoryAccess({ registry, client, logger }, selection);
     if (!authorized.ok) {
-      return fail(
+      return failed(
         runId,
         theRun.intakeItemId,
         selection.selectedRepositoryId,
@@ -340,6 +383,16 @@ export function createGitHubAccessService(deps: GitHubAccessDeps): GitHubAccessS
       },
     });
 
+    return { ok: true, theRun, selection, authorized };
+  }
+
+  async function readFiles(
+    runId: ObjectId,
+    theRun: RunDocument,
+    selection: NonNullable<Awaited<ReturnType<RepositorySelectionRepository['findByRunId']>>>,
+    authorized: AuthorizedRepositoryAccess,
+    filePaths: readonly string[],
+  ): Promise<GitHubAccessResult> {
     const metadata = await client.getRepositoryMetadata(authorized.installationId, authorized.owner, authorized.repo);
     if (!metadata.ok) {
       return fail(
@@ -432,6 +485,38 @@ export function createGitHubAccessService(deps: GitHubAccessDeps): GitHubAccessS
 
       inFlight.set(key, promise);
       return promise;
+    },
+
+    async listFilesForRun(runId: ObjectId): Promise<GitHubFileListResult> {
+      try {
+        const validated = await validateAndAuthorize(runId);
+        if (!validated.ok) return validated.failure;
+        const { theRun, selection, authorized } = validated;
+        const { installationId, owner, repo, branch } = authorized;
+        const repositoryId = selection.selectedRepositoryId;
+        const githubFail = (r: { kind: GitHubAccessFailureKind; message: string; retryAfterMs?: number }) =>
+          fail(runId, theRun.intakeItemId, repositoryId, mapGitHubFailureKind(r.kind), r.message, r.retryAfterMs === undefined ? {} : { retryAfterMs: r.retryAfterMs });
+
+        // branch -> commit -> tree: the tree of exactly the confirmed branch's head.
+        const ref = await client.getRef(installationId, owner, repo, branch);
+        if (!ref.ok) return githubFail(ref);
+        const commit = await client.getCommit(installationId, owner, repo, ref.sha);
+        if (!commit.ok) return githubFail(commit);
+        const tree = await client.getTree(installationId, owner, repo, commit.treeSha);
+        if (!tree.ok) return githubFail(tree);
+
+        await audit.append({
+          actor: GITHUB_ACCESS_SYSTEM_ACTOR,
+          action: 'github.tree.listed',
+          subjectType: 'run',
+          subjectId: runId,
+          detail: { repositoryId, owner, repo, branch, fileCount: tree.files.length, truncated: tree.truncated },
+        });
+        return { ok: true, runId, repositoryId: repositoryId!, owner, repo, branch, files: tree.files, truncated: tree.truncated };
+      } catch (error) {
+        logger.error('github file listing failed unexpectedly', { runId: runId.toHexString(), error });
+        return fail(runId, null, null, 'unexpected_error', 'an unexpected error occurred');
+      }
     },
   };
 }

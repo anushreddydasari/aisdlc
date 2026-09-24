@@ -49,6 +49,7 @@ import { createCodingAgentService, type CodingAgentService } from './coding-agen
 import { createMockCodingAgentProvider } from './coding-agent/provider.ts';
 import { createOpenAiCodingAgentProvider } from './coding-agent/openai-provider.ts';
 import { createRepositoryContextDeps } from './coding-agent/repository-context.ts';
+import { createHeuristicFileSuggester, createOpenAiFileSuggester } from './coding-agent/file-suggestion.ts';
 import type { CodingAgentProvider } from './coding-agent/provider.ts';
 import { createChangeReviewQueueQueries, createChangeReviewRepository } from './change-execution/review-repository.ts';
 import { createChangeExecutionRepository } from './change-execution/execution-repository.ts';
@@ -470,6 +471,25 @@ async function main(): Promise<void> {
                 selections: createRepositorySelectionRepository(db, createAuditLog(db, logger), logger),
                 registry: createRepositoryRegistryRepository(db, createAuditLog(db, logger), logger),
                 client: githubClient,
+              };
+            },
+          },
+          // LLM-picked when OpenAI is configured (with a keyword fallback on any
+          // failure), keyword-only otherwise — see coding-agent/file-suggestion.ts.
+          suggestedFiles: {
+            logger,
+            operatorToken,
+            suggester: openAiConfig.configured
+              ? createOpenAiFileSuggester({ apiKey: openAiConfig.config.apiKey, model: openAiConfig.config.model, logger })
+              : createHeuristicFileSuggester(),
+            get sources() {
+              const db = mongo.db();
+              if (db === undefined) return undefined;
+              return {
+                runs: createRunsRepository(db, logger),
+                intake: createIntakeRepository(db, createAuditLog(db, logger), logger),
+                requirements: createRequirementsRepository(db, logger),
+                githubAccess: createGitHubAccessService(buildGitHubAccessDeps(db)),
               };
             },
           },

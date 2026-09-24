@@ -452,6 +452,45 @@ describe('getCommit', () => {
   });
 });
 
+describe('getTree', () => {
+  it('lists blobs recursively with sizes, skipping directories and submodules', async () => {
+    const h = harness(() =>
+      fakeResponse(200, {
+        sha: 'tree456',
+        truncated: false,
+        tree: [
+          { path: 'index.html', type: 'blob', size: 3712 },
+          { path: 'css', type: 'tree' },
+          { path: 'css/styles.css', type: 'blob', size: 5100 },
+          { path: 'vendor/lib', type: 'commit' },
+        ],
+      }),
+    );
+    const result = await h.client.getTree(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', 'tree456');
+    assert.deepEqual(result, {
+      ok: true,
+      files: [
+        { path: 'index.html', size: 3712 },
+        { path: 'css/styles.css', size: 5100 },
+      ],
+      truncated: false,
+    });
+    assert.match(h.calls.at(-1)!.url, /\/git\/trees\/tree456\?recursive=1$/);
+  });
+
+  it("passes GitHub's truncated flag through", async () => {
+    const h = harness(() => fakeResponse(200, { truncated: true, tree: [] }));
+    const result = await h.client.getTree(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', 'big');
+    assert.equal(result.ok && result.truncated, true);
+  });
+
+  it('maps a missing tree to malformed', async () => {
+    const h = harness(() => fakeResponse(404, { message: 'Not Found' }));
+    const result = await h.client.getTree(INSTALLATION_ID, 'cloudfuze', 'aisdlc-service', 'nope');
+    assert.equal(result.ok === false && result.kind, 'malformed');
+  });
+});
+
 describe('createTree', () => {
   it('posts the base tree and file entries, returning the new tree sha', async () => {
     let sentBody: unknown;

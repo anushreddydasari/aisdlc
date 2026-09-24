@@ -397,6 +397,26 @@ export function renderConsoleUi(options: ConsoleUiOptions): string {
   // no repository file discovery yet — see pipeline/coding-agent-trigger.ts),
   // so the operator lists them here.
   var fileDrafts = {};
+  // Per run: { state: 'loading' | 'ok' | 'error', data?, message? } from
+  // GET /runs/:runId/suggested-files — fetched once, when the panel first shows.
+  var fileSuggestions = {};
+  function parsePaths(text) { return text.split(/[,\\n]/).map(function (s) { return s.trim(); }).filter(Boolean); }
+  function loadSuggestion(runId) {
+    fileSuggestions[runId] = { state: 'loading' };
+    api('GET', '/runs/' + encodeURIComponent(runId) + '/suggested-files').then(function (r) {
+      if (r.status === 200) {
+        fileSuggestions[runId] = { state: 'ok', data: r.data };
+        // Pre-fill only a box the operator has not typed into.
+        if (!fileDrafts[runId]) fileDrafts[runId] = r.data.suggested.join(', ');
+      } else {
+        fileSuggestions[runId] = { state: 'error', message: (r.data && r.data.detail) || explain(r) };
+      }
+      renderTickets();
+    }, function (e) {
+      fileSuggestions[runId] = { state: 'error', message: 'Could not reach the service: ' + e.message };
+      renderTickets();
+    });
+  }
   function codingAgentPanel(t) {
     var box = el('div', 'agent');
     box.addEventListener('click', function (ev) { ev.stopPropagation(); });
@@ -441,9 +461,45 @@ export function renderConsoleUi(options: ConsoleUiOptions): string {
       }, function (e) { show('error', 'Could not reach the service: ' + e.message); })
         .then(function () { run.disabled = false; run.textContent = 'Run Coding Agent'; });
     });
+    // Suggested files: fetched automatically; the box is pre-filled and every
+    // editable file in the repository is listed as a checkbox.
+    var runId = t.run.runId, sug = fileSuggestions[runId];
+    if (sug === undefined) { loadSuggestion(runId); sug = fileSuggestions[runId]; }
+    var hint = el('div', 'meta');
+    if (sug.state === 'loading') hint.textContent = 'Looking at the repository\\'s files to suggest which ones to change…';
+    else if (sug.state === 'error') hint.textContent = 'Could not suggest files: ' + sug.message + ' — type them instead.';
+    else hint.textContent = (sug.data.suggested.length ? 'Suggested ' + (sug.data.source === 'llm' ? 'by the model' : 'by keyword match') + ': ' : '') + sug.data.reason;
     box.appendChild(label);
     box.appendChild(files);
+    box.appendChild(hint);
+    if (sug.state === 'ok' && sug.data.files.length) {
+      var pick = el('details');
+      pick.appendChild(el('summary', '', 'All editable files in ' + sug.data.repository + ' (' + sug.data.files.length + ')' +
+        (sug.data.excluded.length ? ' — ' + sug.data.excluded.length + ' binary/vendor file(s) hidden' : '') + (sug.data.truncated ? ' — list truncated by GitHub' : '')));
+      var chosen = parsePaths(files.value);
+      sug.data.files.slice(0, 300).forEach(function (f) {
+        var row = el('label', 'candidate'), cb = el('input');
+        cb.type = 'checkbox';
+        cb.checked = chosen.indexOf(f.path) >= 0;
+        cb.addEventListener('change', function () {
+          var list = parsePaths(files.value).filter(function (p) { return p !== f.path; });
+          if (cb.checked) list.push(f.path);
+          files.value = list.join(', ');
+          fileDrafts[runId] = files.value;
+        });
+        row.appendChild(cb);
+        var txt = el('span', '', f.path);
+        row.appendChild(txt);
+        row.appendChild(el('span', 'url', '  ' + f.size + ' bytes'));
+        pick.appendChild(row);
+      });
+      box.appendChild(pick);
+    }
+    var again = el('button', '', 'Suggest again');
+    again.type = 'button';
+    again.addEventListener('click', function () { delete fileDrafts[runId]; loadSuggestion(runId); renderTickets(); });
     actions.appendChild(run);
+    if (sug.state !== 'loading') actions.appendChild(again);
     box.appendChild(actions);
     return box;
   }
