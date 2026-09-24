@@ -23,6 +23,11 @@ export interface SyntheticEventOptions {
   readonly issueKey: string;
   readonly event?: string;
   readonly timestamp?: string;
+  /** Overrides for the mock ticket creator; the CLI leaves these unset. */
+  readonly summary?: string;
+  readonly type?: string;
+  readonly priority?: string;
+  readonly spaceKey?: string;
 }
 
 /** A payload matching Neutara's IssueEventPayload, with obvious test values. */
@@ -32,10 +37,10 @@ export function buildSyntheticEvent(options: SyntheticEventOptions): Record<stri
     timestamp: options.timestamp ?? new Date().toISOString(),
     issue: {
       key: options.issueKey,
-      summary: `Local test ticket ${options.issueKey}`,
-      type: 'task',
-      priority: 'medium',
-      spaceKey: 'LOCAL',
+      summary: options.summary ?? `Local test ticket ${options.issueKey}`,
+      type: options.type ?? 'task',
+      priority: options.priority ?? 'medium',
+      spaceKey: options.spaceKey ?? 'LOCAL',
       url: `http://127.0.0.1/browse/${options.issueKey}`,
     },
   };

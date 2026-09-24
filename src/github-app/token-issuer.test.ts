@@ -190,11 +190,11 @@ describe('createTokenIssuer: error classification', () => {
     assert.equal(result.ok === false && result.kind, 'installation_not_found');
   });
 
-  it('maps 401 to insufficient_permission', async () => {
+  it('maps 401 to authentication_failed', async () => {
     const h = harness(() => fakeResponse(401));
     const result = await createTokenIssuer(h.options).getInstallationToken(1);
     assert.equal(result.ok, false);
-    assert.equal(result.ok === false && result.kind, 'insufficient_permission');
+    assert.equal(result.ok === false && result.kind, 'authentication_failed');
   });
 
   it('maps 403 with no rate-limit headers to insufficient_permission', async () => {
@@ -277,7 +277,7 @@ describe('createTokenIssuer: error classification', () => {
     assert.equal(result.ok === false && result.kind, 'transient');
   });
 
-  it('maps a timeout to transient', async () => {
+  it('maps a timeout to the dedicated timeout kind, distinct from transient', async () => {
     const fetchFn = (async (_input: string | URL | Request, init?: RequestInit) => {
       return new Promise<Response>((_resolve, reject) => {
         init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
@@ -286,7 +286,7 @@ describe('createTokenIssuer: error classification', () => {
     const h = harness(() => fakeResponse(201), { fetchFn, timeoutMs: 5 } as Partial<TokenIssuerOptions>);
     const result = await createTokenIssuer(h.options).getInstallationToken(1);
     assert.equal(result.ok, false);
-    assert.equal(result.ok === false && result.kind, 'transient');
+    assert.equal(result.ok === false && result.kind, 'timeout');
     assert.match(result.ok === false ? result.message : '', /timed out/);
   });
 });

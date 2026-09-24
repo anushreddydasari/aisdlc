@@ -168,6 +168,85 @@ describe('authentication', () => {
     const result = await handleCreateRegistryEntry(request({ operator: 'alice' }), h.deps);
     assert.equal(result.statusCode, 503);
   });
+
+  it('refuses an update with no operator token configured', async () => {
+    const h = harness({ token: undefined });
+    const id = h.store[0]!._id!.toHexString();
+    const result = await handleUpdateRegistryEntry(request({ operator: 'mallory' }), h.deps, id);
+    assert.equal(result.statusCode, 401);
+    assert.equal(h.calls.length, 0, 'the repository must never be reached for an unauthorized request');
+  });
+
+  it('refuses an update with a wrong bearer token', async () => {
+    const h = harness();
+    const id = h.store[0]!._id!.toHexString();
+    const req = request({ operator: 'mallory' }, { authorization: `${BEARER_PREFIX}wrong` });
+    const result = await handleUpdateRegistryEntry(req, h.deps, id);
+    assert.equal(result.statusCode, 401);
+    assert.equal(h.calls.length, 0);
+  });
+
+  it('refuses a deactivate with no operator token configured', async () => {
+    const h = harness({ token: undefined });
+    const id = h.store[0]!._id!.toHexString();
+    const result = await handleSetRegistryEntryStatus(request({ operator: 'mallory' }), h.deps, id, 'inactive');
+    assert.equal(result.statusCode, 401);
+    assert.equal(h.calls.length, 0);
+  });
+
+  it('refuses a deactivate with a wrong bearer token', async () => {
+    const h = harness();
+    const id = h.store[0]!._id!.toHexString();
+    const req = request({ operator: 'mallory' }, { authorization: `${BEARER_PREFIX}wrong` });
+    const result = await handleSetRegistryEntryStatus(req, h.deps, id, 'inactive');
+    assert.equal(result.statusCode, 401);
+    assert.equal(h.calls.length, 0);
+  });
+
+  it('refuses a reactivate with a wrong bearer token', async () => {
+    const h = harness({ seed: [entry({ status: 'inactive' })] });
+    const id = h.store[0]!._id!.toHexString();
+    const req = request({ operator: 'mallory' }, { authorization: `${BEARER_PREFIX}wrong` });
+    const result = await handleSetRegistryEntryStatus(req, h.deps, id, 'active');
+    assert.equal(result.statusCode, 401);
+    assert.equal(h.calls.length, 0);
+  });
+});
+
+describe('secrets are never returned by the registry API', () => {
+  it('the serialized entry never carries a token, key, or Authorization-shaped field', async () => {
+    const h = harness({
+      seed: [
+        entry({
+          accessPolicy: { installationId: 42 },
+        }),
+      ],
+    });
+    const result = await handleListRegistryEntries(request(null), h.deps, new URLSearchParams());
+    const serialized = JSON.stringify(result.body).toLowerCase();
+    assert.ok(!serialized.includes('"token"'));
+    assert.ok(!serialized.includes('privatekey'));
+    assert.ok(!serialized.includes('authorization'));
+    assert.ok(!serialized.includes('jwt'));
+  });
+
+  it('accessPolicy is passed through as-is, but this API never adds a credential to it', async () => {
+    const h = harness({ seed: [] });
+    const result = await handleCreateRegistryEntry(
+      request({
+        projectIdentifier: 'CF',
+        repositoryId: 'aisdlc-service',
+        repositoryUrl: 'https://github.com/cloudfuze/aisdlc-service',
+        defaultBranch: 'main',
+        allowedBranches: ['main'],
+        accessPolicy: { installationId: 42 },
+        operator: 'alice',
+      }),
+      h.deps,
+    );
+    assert.equal(result.statusCode, 201);
+    assert.deepEqual(result.body['accessPolicy'], { installationId: 42 });
+  });
 });
 
 describe('handleCreateRegistryEntry', () => {

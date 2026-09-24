@@ -10,8 +10,15 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 
 import type { Logger } from '../logging/logger.ts';
 import { handleApproval, type ApprovalDeps } from './approval.ts';
+import { handleChangeReviewDecision, type ChangeReviewDeps } from './change-review.ts';
+import { handleTriggerCodingAgent, type CodingAgentApiDeps } from './coding-agent.ts';
+import { handleGetDeploymentStatus, type DeploymentStatusDeps } from './deployment-status.ts';
 import { buildLiveness, buildReadiness, type HealthDeps } from './health.ts';
 import { handleIngest, type IngestDeps } from './ingest.ts';
+import { handleGetOperatorQueue, type OperatorQueueDeps } from './operator-queue.ts';
+import { handleGetOperatorTickets, type OperatorTicketsDeps } from './operator-tickets.ts';
+import { renderConsoleUi, type ConsoleUiOptions } from './console-ui.ts';
+import { handleDeleteTestTicket, type TicketDeleteDeps } from './ticket-delete.ts';
 import {
   handleCreateRegistryEntry,
   handleGetRegistryEntry,
@@ -20,7 +27,10 @@ import {
   handleUpdateRegistryEntry,
   type RepositoryRegistryDeps,
 } from './repository-registry.ts';
+import { REPOSITORY_UI_HTML, REPOSITORY_UI_DELETE_FLAG_OFF, REPOSITORY_UI_DELETE_FLAG_ON } from './repository-ui.ts';
+import { handleDeleteRegistryEntry, type RegistryDeleteDeps } from './registry-delete.ts';
 import { handleConfirmRepositorySelection, type RepositorySelectionDeps } from './repository-selection.ts';
+import { handleGetRunStatus, type RunStatusDeps } from './run-status.ts';
 
 export interface ServerDeps {
   readonly logger: Logger;
@@ -38,6 +48,24 @@ export interface ServerDeps {
   readonly repositoryRegistry?: RepositoryRegistryDeps | undefined;
   /** Same "mounted but refuses without a token" choice as `approval`. */
   readonly repositorySelection?: RepositorySelectionDeps | undefined;
+  /** Same "mounted but refuses without a token" choice as `approval`. */
+  readonly runStatus?: RunStatusDeps | undefined;
+  /** Same "mounted but refuses without a token" choice as `approval`. */
+  readonly codingAgent?: CodingAgentApiDeps | undefined;
+  /** Same "mounted but refuses without a token" choice as `approval`. */
+  readonly changeReview?: ChangeReviewDeps | undefined;
+  /** Same "mounted but refuses without a token" choice as `approval`. */
+  readonly deploymentStatus?: DeploymentStatusDeps | undefined;
+  /** Same "mounted but refuses without a token" choice as `approval`. */
+  readonly operatorQueue?: OperatorQueueDeps | undefined;
+  /** Same "mounted but refuses without a token" choice as `approval`. */
+  readonly operatorTickets?: OperatorTicketsDeps | undefined;
+  /** Absent means the console shows no Create-test-ticket tab. */
+  readonly consoleUi?: ConsoleUiOptions | undefined;
+  /** Test mode only — absent (outside test mode) means the delete route answers 404. */
+  readonly ticketDelete?: TicketDeleteDeps | undefined;
+  /** Test mode only — absent means the registry delete route answers 404 and the page shows no Delete. */
+  readonly registryDelete?: RegistryDeleteDeps | undefined;
 }
 
 /** POST /intake/{issueKey}/approve or /reject. issueKey is opaque, so no slashes. */
@@ -47,11 +75,25 @@ const APPROVAL_PATH = /^\/intake\/([^/]+)\/(approve|reject)$/;
 const REGISTRY_COLLECTION_PATH = /^\/repository-registry$/;
 /** GET/PATCH /repository-registry/{id} — get or update one entry. */
 const REGISTRY_ITEM_PATH = /^\/repository-registry\/([^/]+)$/;
+/** POST /repository-registry/{id}/delete — test mode only, inactive entries only. */
+const REGISTRY_DELETE_PATH = /^\/repository-registry\/([^/]+)\/delete$/;
 /** POST /repository-registry/{id}/deactivate or /reactivate. */
 const REGISTRY_STATUS_PATH = /^\/repository-registry\/([^/]+)\/(deactivate|reactivate)$/;
 
 /** POST /repository-selections/{runId}/confirm. */
 const SELECTION_CONFIRM_PATH = /^\/repository-selections\/([^/]+)\/confirm$/;
+
+/** POST /operator/tickets/{issueKey}/delete — test mode only. */
+const TICKET_DELETE_PATH = /^\/operator\/tickets\/([^/]+)\/delete$/;
+
+/** GET /runs/{runId} — the composed end-to-end status view. */
+const RUN_STATUS_PATH = /^\/runs\/([^/]+)$/;
+/** POST /runs/{runId}/coding-agent. */
+const RUN_CODING_AGENT_PATH = /^\/runs\/([^/]+)\/coding-agent$/;
+/** POST /change-reviews/{reviewId}/approve or /reject. */
+const CHANGE_REVIEW_DECISION_PATH = /^\/change-reviews\/([^/]+)\/(approve|reject)$/;
+/** GET /runs/{runId}/deployment — the detailed deployment record for a run. */
+const RUN_DEPLOYMENT_PATH = /^\/runs\/([^/]+)\/deployment$/;
 
 /**
  * Neutara does not retry, so a slow or stalled request costs an event. These
@@ -68,6 +110,15 @@ function sendJson(res: ServerResponse, statusCode: number, body: unknown): void 
     'cache-control': 'no-store',
   });
   res.end(payload);
+}
+
+function sendHtml(res: ServerResponse, statusCode: number, html: string): void {
+  res.writeHead(statusCode, {
+    'content-type': 'text/html; charset=utf-8',
+    'content-length': Buffer.byteLength(html),
+    'cache-control': 'no-store',
+  });
+  res.end(html);
 }
 
 export async function handleRequest(
@@ -106,6 +157,22 @@ export async function handleRequest(
     }
     const [, issueKey, action] = approvalMatch as unknown as [string, string, 'approve' | 'reject'];
     const result = await handleApproval(req, deps.approval, decodeURIComponent(issueKey), action);
+    sendJson(res, result.statusCode, result.body);
+    return;
+  }
+
+  const registryDeleteMatch = REGISTRY_DELETE_PATH.exec(path);
+  if (registryDeleteMatch) {
+    if (method !== 'POST') {
+      sendJson(res, 405, { error: 'method_not_allowed' });
+      return;
+    }
+    if (deps.registryDelete === undefined) {
+      sendJson(res, 404, { error: 'not_found' });
+      return;
+    }
+    const [, id] = registryDeleteMatch as unknown as [string, string];
+    const result = await handleDeleteRegistryEntry(req, deps.registryDelete, decodeURIComponent(id));
     sendJson(res, result.statusCode, result.body);
     return;
   }
@@ -167,6 +234,22 @@ export async function handleRequest(
     return;
   }
 
+  const ticketDeleteMatch = TICKET_DELETE_PATH.exec(path);
+  if (ticketDeleteMatch) {
+    if (method !== 'POST') {
+      sendJson(res, 405, { error: 'method_not_allowed' });
+      return;
+    }
+    if (deps.ticketDelete === undefined) {
+      sendJson(res, 404, { error: 'not_found' });
+      return;
+    }
+    const [, issueKey] = ticketDeleteMatch as unknown as [string, string];
+    const result = await handleDeleteTestTicket(req, deps.ticketDelete, decodeURIComponent(issueKey));
+    sendJson(res, result.statusCode, result.body);
+    return;
+  }
+
   const selectionConfirmMatch = SELECTION_CONFIRM_PATH.exec(path);
   if (selectionConfirmMatch) {
     if (method !== 'POST') {
@@ -187,6 +270,70 @@ export async function handleRequest(
     return;
   }
 
+  const codingAgentMatch = RUN_CODING_AGENT_PATH.exec(path);
+  if (codingAgentMatch) {
+    if (method !== 'POST') {
+      sendJson(res, 405, { error: 'method_not_allowed' });
+      return;
+    }
+    if (deps.codingAgent === undefined) {
+      sendJson(res, 404, { error: 'not_found' });
+      return;
+    }
+    const [, runId] = codingAgentMatch as unknown as [string, string];
+    const result = await handleTriggerCodingAgent(req, deps.codingAgent, decodeURIComponent(runId));
+    sendJson(res, result.statusCode, result.body);
+    return;
+  }
+
+  const changeReviewMatch = CHANGE_REVIEW_DECISION_PATH.exec(path);
+  if (changeReviewMatch) {
+    if (method !== 'POST') {
+      sendJson(res, 405, { error: 'method_not_allowed' });
+      return;
+    }
+    if (deps.changeReview === undefined) {
+      sendJson(res, 404, { error: 'not_found' });
+      return;
+    }
+    const [, reviewId, action] = changeReviewMatch as unknown as [string, string, 'approve' | 'reject'];
+    const result = await handleChangeReviewDecision(req, deps.changeReview, decodeURIComponent(reviewId), action);
+    sendJson(res, result.statusCode, result.body);
+    return;
+  }
+
+  const runDeploymentMatch = RUN_DEPLOYMENT_PATH.exec(path);
+  if (runDeploymentMatch) {
+    if (method !== 'GET' && method !== 'HEAD') {
+      sendJson(res, 405, { error: 'method_not_allowed' });
+      return;
+    }
+    if (deps.deploymentStatus === undefined) {
+      sendJson(res, 404, { error: 'not_found' });
+      return;
+    }
+    const [, runId] = runDeploymentMatch as unknown as [string, string];
+    const result = await handleGetDeploymentStatus(req, deps.deploymentStatus, decodeURIComponent(runId));
+    sendJson(res, result.statusCode, result.body);
+    return;
+  }
+
+  const runStatusMatch = RUN_STATUS_PATH.exec(path);
+  if (runStatusMatch) {
+    if (method !== 'GET' && method !== 'HEAD') {
+      sendJson(res, 405, { error: 'method_not_allowed' });
+      return;
+    }
+    if (deps.runStatus === undefined) {
+      sendJson(res, 404, { error: 'not_found' });
+      return;
+    }
+    const [, runId] = runStatusMatch as unknown as [string, string];
+    const result = await handleGetRunStatus(req, deps.runStatus, decodeURIComponent(runId));
+    sendJson(res, result.statusCode, result.body);
+    return;
+  }
+
   if (method !== 'GET' && method !== 'HEAD') {
     sendJson(res, 405, { error: 'method_not_allowed' });
     return;
@@ -201,6 +348,41 @@ export async function handleRequest(
       sendJson(res, statusCode, body);
       return;
     }
+    case '/operator/queue': {
+      if (deps.operatorQueue === undefined) {
+        sendJson(res, 404, { error: 'not_found' });
+        return;
+      }
+      const result = await handleGetOperatorQueue(req, deps.operatorQueue);
+      sendJson(res, result.statusCode, result.body);
+      return;
+    }
+    case '/operator/tickets': {
+      if (deps.operatorTickets === undefined) {
+        sendJson(res, 404, { error: 'not_found' });
+        return;
+      }
+      const result = await handleGetOperatorTickets(req, deps.operatorTickets);
+      sendJson(res, result.statusCode, result.body);
+      return;
+    }
+    case '/console':
+      // Static page, same posture as /repositories below: it only calls the
+      // /operator/* reads and the pre-existing gate routes from the browser.
+      sendHtml(res, 200, renderConsoleUi(deps.consoleUi ?? { ticketCreatorUrl: null }));
+      return;
+    case '/operator':
+      // The approvals page now lives in the console; keep the old link working.
+      res.writeHead(302, { location: '/console#approvals', 'cache-control': 'no-store' });
+      res.end();
+      return;
+    case '/repositories':
+      // Static admin page — see repository-ui.ts's module comment. No deps
+      // to check: it has no server-side logic of its own, only calls the
+      // already-gated /repository-registry JSON API from the browser.
+      // The Delete button exists only when the delete route is mounted.
+      sendHtml(res, 200, deps.registryDelete === undefined ? REPOSITORY_UI_HTML : REPOSITORY_UI_HTML.replace(REPOSITORY_UI_DELETE_FLAG_OFF, REPOSITORY_UI_DELETE_FLAG_ON));
+      return;
     default:
       sendJson(res, 404, { error: 'not_found' });
   }

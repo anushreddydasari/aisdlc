@@ -21,6 +21,14 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 
+import {
+  createTicketStore,
+  createWebhookSender,
+  handleTicketAdminRequest,
+  isTicketAdminPath,
+  type TicketStore,
+} from './mock-ticket-creator.ts';
+
 export const DEFAULT_MOCK_PORT = 4601;
 
 /** Issues this mock knows about, keyed by BOTH identifiers. */
@@ -46,9 +54,22 @@ export function mockIssues(): Map<string, Record<string, unknown>> {
     createdAt: '2026-09-21T00:00:00.000Z',
   };
 
+  // A second, independent ticket, so a local end-to-end run can be repeated
+  // without first deleting LOCAL-1001's intake item (issueKey is unique).
+  const cf33262 = {
+    ...cf33261,
+    key: 'LOCAL-1002',
+    cfKey: 'CF-33262',
+    summary: 'Second local mock ticket for repeat end-to-end testing',
+    description: '<p>Add a health-check note to the README describing the /health/ready endpoint.</p>',
+    createdAt: '2026-09-23T00:00:00.000Z',
+  };
+
   const byIdentifier = new Map<string, Record<string, unknown>>();
-  byIdentifier.set(cf33261.key, cf33261);
-  byIdentifier.set(cf33261.cfKey, cf33261);
+  for (const issue of [cf33261, cf33262]) {
+    byIdentifier.set(issue.key, issue);
+    byIdentifier.set(issue.cfKey, issue);
+  }
   return byIdentifier;
 }
 
@@ -61,7 +82,11 @@ function sendJson(res: ServerResponse, statusCode: number, body: unknown): void 
   res.end(payload);
 }
 
-export function handleMockRequest(req: IncomingMessage, res: ServerResponse): void {
+/**
+ * `created` is the ticket creator's store (mock-ticket-creator.ts): tickets
+ * made through the page are served from here exactly like the fixtures.
+ */
+export function handleMockRequest(req: IncomingMessage, res: ServerResponse, created?: TicketStore): void {
   const url = new URL(req.url ?? '/', 'http://127.0.0.1');
 
   if (req.method !== 'GET') {
@@ -84,7 +109,8 @@ export function handleMockRequest(req: IncomingMessage, res: ServerResponse): vo
     return;
   }
 
-  const issue = mockIssues().get(decodeURIComponent(match[1]!));
+  const identifier = decodeURIComponent(match[1]!);
+  const issue = mockIssues().get(identifier) ?? created?.get(identifier)?.issue;
   if (issue === undefined) {
     sendJson(res, 404, { error: 'not_found' });
     return;
@@ -96,12 +122,28 @@ export function handleMockRequest(req: IncomingMessage, res: ServerResponse): vo
 // ── CLI ──────────────────────────────────────────────────────────────────
 if (process.argv[1]?.endsWith('mock-neutara.ts')) {
   const port = Number(process.env['MOCK_NEUTARA_PORT'] ?? DEFAULT_MOCK_PORT);
+  const created = createTicketStore();
+  const ticketAdmin = {
+    store: created,
+    sendWebhook: createWebhookSender(process.env),
+    port,
+    servicePort: Number((process.env['AISDLC_PORT'] ?? '4600').trim()),
+  };
   const server = createServer((req, res) => {
     const started = Date.now();
     res.on('finish', () => {
       console.log(`${req.method} ${req.url} -> ${res.statusCode} (${Date.now() - started}ms)`);
     });
-    handleMockRequest(req, res);
+    const pathname = new URL(req.url ?? '/', 'http://127.0.0.1').pathname;
+    if (isTicketAdminPath(pathname)) {
+      handleTicketAdminRequest(req, res, ticketAdmin).catch((error: unknown) => {
+        console.error('ticket creator request failed:', (error as Error).message);
+        if (!res.headersSent) res.writeHead(500, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'internal_error' }));
+      });
+      return;
+    }
+    handleMockRequest(req, res, created);
   });
 
   // Loopback only.
@@ -109,6 +151,7 @@ if (process.argv[1]?.endsWith('mock-neutara.ts')) {
     console.log(`mock neutara listening on http://127.0.0.1:${port}`);
     console.log('  known identifiers: ' + [...mockIssues().keys()].join(', '));
     console.log(`  set NEUTARA_API_BASE_URL=http://127.0.0.1:${port}`);
+    console.log(`  ticket creator UI: http://127.0.0.1:${port}/`);
   });
 
   process.on('SIGINT', () => server.close(() => process.exit(0)));

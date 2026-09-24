@@ -99,7 +99,7 @@ export function createTokenIssuer(options: TokenIssuerOptions): TokenIssuer {
         return failure('installation_not_found', `installation ${installationId} was not found`);
       }
       if (response.status === 401) {
-        return failure('insufficient_permission', 'github rejected the App-level JWT');
+        return failure('authentication_failed', 'github rejected the App-level JWT');
       }
 
       const rateLimit = classifyRateLimit(response.status, response.headers, now());
@@ -139,7 +139,9 @@ export function createTokenIssuer(options: TokenIssuerOptions): TokenIssuer {
     } catch (error) {
       const aborted = error instanceof Error && error.name === 'AbortError';
       logger.warn('github installation token request failed', { installationId, timedOut: aborted, error });
-      return failure('transient', aborted ? `request timed out after ${timeoutMs}ms` : 'request failed');
+      return aborted
+        ? failure('timeout', `request timed out after ${timeoutMs}ms`)
+        : failure('transient', 'request failed');
     } finally {
       clearTimeout(timer);
     }

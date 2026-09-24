@@ -47,6 +47,48 @@ export const COLLECTIONS = {
    */
   repositorySelections: 'repositorySelections',
   /**
+   * One row per Coding Agent proposal (an implementation plan + proposed
+   * changes) submitted for human review. Immutable once created — a
+   * regenerated proposal is a NEW row (a different `proposalHash`), never
+   * an update to an existing one, which is what makes "the approval
+   * applies to exactly the proposal that will be executed" meaningful:
+   * approving THIS row can never later be reinterpreted as approving
+   * different content.
+   */
+  changeReviews: 'changeReviews',
+  /**
+   * One row per executed (or attempted) approved review — the durable
+   * record `change-execution.*` idempotency and audit history are built
+   * on. Deliberately separate from `changeReviews`: a review is a human
+   * decision, an execution is a system outcome, the same separation this
+   * codebase keeps everywhere else (`intakeItems` vs `runs`,
+   * `repositorySelections` vs its own confirmation fields).
+   */
+  changeExecutions: 'changeExecutions',
+  /**
+   * One row per publish ATTEMPT for a succeeded change execution — the
+   * durable idempotency record for the GitHub Write + Pull Request
+   * Workflow phase (src/github-publish/). Unique on `executionId`
+   * (`executionId_unique`), the same "reuse the existing change-execution
+   * identity, never a second competing run-identity system" discipline
+   * `changeExecutions.reviewId_unique` already established for the phase
+   * before it: a given approved execution may be published at most once,
+   * ever.
+   */
+  githubPublications: 'githubPublications',
+  /**
+   * One row per publication whose PR-merge outcome has been observed —
+   * created the moment merge detection first has something to report
+   * (either the PR was merged, or it was closed without merging), never
+   * before. Unique on `publicationId` (`publicationId_unique`): a given
+   * publication gets exactly one deployment-lifecycle row, ever, whether
+   * that ends in a real deployment attempt or a terminal `closed_unmerged`
+   * fact — the same "reuse the existing identity chain, one row per
+   * outcome" discipline `githubPublications.executionId_unique` already
+   * established one phase up.
+   */
+  deployments: 'deployments',
+  /**
    * Append-only record of every state change. Enforced by the database:
    * aisdlcAppRole grants `find` and `insert` on this collection and nothing
    * else. See docs/atlas-roles.md, and src/db/audit-log.ts for the
@@ -152,6 +194,37 @@ export type RepositoryRegistryStatus = (typeof REPOSITORY_REGISTRY_STATUSES)[num
 export const REPOSITORY_SELECTION_STATUSES = ['pending', 'selected', 'failed', 'ambiguous'] as const;
 export type RepositorySelectionStatus = (typeof REPOSITORY_SELECTION_STATUSES)[number];
 
+/**
+ * No `expired` status, deliberately: an approval's validity is time-based
+ * (see change-execution/execution-service.ts's `approvalValidityMs`), not
+ * a state anything transitions into. A stale-but-still-`approved` row is
+ * refused at execution time by comparing `reviewedAt` against the clock,
+ * not by a background job flipping the status — the same "don't add a
+ * status the architecture doesn't need" discipline `repositoryRegistry`
+ * already applies (no `pending` status there either).
+ */
+export const CHANGE_REVIEW_STATUSES = ['pending', 'approved', 'rejected'] as const;
+export type ChangeReviewStatus = (typeof CHANGE_REVIEW_STATUSES)[number];
+
+export const CHANGE_EXECUTION_STATUSES = ['succeeded', 'failed'] as const;
+export type ChangeExecutionStatus = (typeof CHANGE_EXECUTION_STATUSES)[number];
+
+export const GITHUB_PUBLICATION_STATUSES = ['published', 'failed'] as const;
+export type GithubPublicationStatus = (typeof GITHUB_PUBLICATION_STATUSES)[number];
+
+/**
+ * `queued` exists in this vocabulary for schema completeness — a future
+ * real, asynchronous deployment provider would sit in it while a job
+ * waits its turn. This phase's deployment worker claims a row straight
+ * from `eligible` to `running` (see deployment/deployment-repository.ts's
+ * `claim()`), since there is nothing yet for a row to queue behind.
+ * `closed_unmerged` is deliberately its own terminal state, not folded
+ * into `failed`: a PR closed without merging was never a deployment
+ * failure — no deployment was ever attempted for it.
+ */
+export const DEPLOYMENT_STATUSES = ['eligible', 'queued', 'running', 'succeeded', 'failed', 'closed_unmerged'] as const;
+export type DeploymentStatus = (typeof DEPLOYMENT_STATUSES)[number];
+
 export const CHECKPOINT_STATUSES = [
   /** Executing, or the worker died mid-step. Resume re-runs it. */
   'running',
@@ -196,6 +269,10 @@ export const AUDIT_SUBJECT_TYPES = [
   'webhookDelivery',
   'repositoryRegistryEntry',
   'repositorySelection',
+  'changeReview',
+  'changeExecution',
+  'githubPublication',
+  'deployment',
 ] as const;
 export type AuditSubjectType = (typeof AUDIT_SUBJECT_TYPES)[number];
 
@@ -313,6 +390,46 @@ export const INDEXES: Readonly<Record<CollectionName, readonly IndexDefinition[]
     // The retry worker's poll query: unresolved selections due for
     // re-evaluation. Mirrors webhookDeliveries.status_nextAttemptAt exactly.
     { name: 'status_nextAttemptAt', key: { status: 1, nextAttemptAt: 1 } },
+  ],
+  [COLLECTIONS.changeReviews]: [
+    // Idempotent creation: the SAME proposal content (same plan +
+    // proposedChanges, byte-for-byte via the canonical hash) only ever
+    // gets one review row, the same createIfAbsent-on-a-unique-index
+    // pattern used everywhere else in this codebase. A regenerated
+    // proposal — even for the same run — has a different hash and
+    // therefore creates a new row, never overwrites this one.
+    { name: 'proposalHash_unique', key: { proposalHash: 1 }, options: { unique: true } },
+    // "Is this still the latest review for the run" (decision: an
+    // approval on a superseded proposal must not authorize execution) —
+    // sorted by createdAt to find the most recent row for a run.
+    { name: 'runId_createdAt', key: { runId: 1, createdAt: -1 } },
+    { name: 'status_updatedAt', key: { status: 1, updatedAt: 1 } },
+  ],
+  [COLLECTIONS.changeExecutions]: [
+    // The idempotency guard requirement 10 exists to serve: a review may
+    // be executed at most once, ever. A second attempt finds this row and
+    // returns it rather than re-applying anything.
+    { name: 'reviewId_unique', key: { reviewId: 1 }, options: { unique: true } },
+    { name: 'runId_createdAt', key: { runId: 1, createdAt: -1 } },
+    // The pipeline queue's own poll: "succeeded executions with no publication yet."
+    { name: 'status_createdAt', key: { status: 1, createdAt: 1 } },
+  ],
+  [COLLECTIONS.githubPublications]: [
+    // A given approved execution is published at most once, ever — the
+    // same idempotency shape as changeExecutions.reviewId_unique.
+    { name: 'executionId_unique', key: { executionId: 1 }, options: { unique: true } },
+    { name: 'runId_createdAt', key: { runId: 1, createdAt: -1 } },
+    // The PR-merge detection worker's own poll: "published, not yet merge-checked."
+    { name: 'status_createdAt', key: { status: 1, createdAt: 1 } },
+  ],
+  [COLLECTIONS.deployments]: [
+    // A given publication's merge outcome (eligible-or-closed_unmerged) is
+    // recorded at most once, ever — the same idempotency shape as
+    // githubPublications.executionId_unique.
+    { name: 'publicationId_unique', key: { publicationId: 1 }, options: { unique: true } },
+    { name: 'runId_createdAt', key: { runId: 1, createdAt: -1 } },
+    // The deployment worker's own poll: "eligible deployments to claim."
+    { name: 'status_createdAt', key: { status: 1, createdAt: 1 } },
   ],
 };
 
@@ -724,6 +841,165 @@ export const REPOSITORY_SELECTION_VALIDATOR: Document = {
   },
 };
 
+/**
+ * Validator for a Coding Agent proposal submitted for human review.
+ *
+ * `plan` and `proposedChanges` are freeform objects here — their real
+ * shape is owned by src/coding-agent/types.ts (`ImplementationPlan`,
+ * `ProposedChange`), the same "shape owned by application code, not
+ * re-specified in the schema" treatment `requirementsAnalyses.result` and
+ * `auditLog.detail` already get. `proposalHash` is what this schema DOES
+ * enforce structurally: it must exist and be a real hash, because the
+ * unique index on it is the whole idempotency mechanism.
+ */
+export const CHANGE_REVIEW_VALIDATOR: Document = {
+  $jsonSchema: {
+    bsonType: 'object',
+    required: [
+      'runId',
+      'intakeItemId',
+      'repositoryId',
+      'owner',
+      'repo',
+      'branch',
+      'plan',
+      'proposedChanges',
+      'proposalHash',
+      'status',
+      'createdAt',
+      'updatedAt',
+    ],
+    additionalProperties: true,
+    properties: {
+      runId: { bsonType: 'objectId' },
+      intakeItemId: { bsonType: 'objectId' },
+      // A snapshot at review-creation time — deliberately never re-read
+      // from the registry/selection afterwards, the same reason
+      // repositorySelections snapshots its own selected* fields.
+      repositoryId: { bsonType: 'string', minLength: 1 },
+      owner: { bsonType: 'string', minLength: 1 },
+      repo: { bsonType: 'string', minLength: 1 },
+      branch: { bsonType: 'string', minLength: 1 },
+      plan: { bsonType: 'object' },
+      proposedChanges: { bsonType: 'array' },
+      proposalHash: { bsonType: 'string', minLength: 1 },
+      status: { enum: [...CHANGE_REVIEW_STATUSES] },
+      reviewedBy: { bsonType: ['string', 'null'] },
+      reviewedAt: { bsonType: ['date', 'null'] },
+      reviewComment: { bsonType: ['string', 'null'] },
+      createdAt: { bsonType: 'date' },
+      updatedAt: { bsonType: 'date' },
+    },
+  },
+};
+
+/**
+ * Validator for one execution attempt of an approved review.
+ *
+ * `appliedChanges` and `validation` are safe metadata only — paths,
+ * operations, and pass/fail summaries, never file content. See
+ * src/change-execution/execution-service.ts for what actually populates
+ * them.
+ */
+export const CHANGE_EXECUTION_VALIDATOR: Document = {
+  $jsonSchema: {
+    bsonType: 'object',
+    required: ['runId', 'reviewId', 'proposalHash', 'status', 'appliedChanges', 'createdAt'],
+    additionalProperties: true,
+    properties: {
+      runId: { bsonType: 'objectId' },
+      reviewId: { bsonType: 'objectId' },
+      proposalHash: { bsonType: 'string', minLength: 1 },
+      status: { enum: [...CHANGE_EXECUTION_STATUSES] },
+      appliedChanges: {
+        bsonType: 'array',
+        items: {
+          bsonType: 'object',
+          required: ['path', 'operation'],
+          properties: {
+            path: { bsonType: 'string' },
+            operation: { enum: ['create', 'modify'] },
+          },
+        },
+      },
+      validation: { bsonType: ['object', 'null'] },
+      failureCategory: { bsonType: ['string', 'null'] },
+      failureMessage: { bsonType: ['string', 'null'] },
+      createdAt: { bsonType: 'date' },
+      completedAt: { bsonType: ['date', 'null'] },
+    },
+  },
+};
+
+/**
+ * Validator for one publish attempt of a successfully executed, validated
+ * change. `baseSha` is the base branch's commit sha AT THE TIME the branch
+ * was created — captured so a later read can tell "the base branch has
+ * moved since we published" without needing to re-derive it. Never a
+ * secret: a commit sha is a public, non-sensitive identifier.
+ */
+export const GITHUB_PUBLICATION_VALIDATOR: Document = {
+  $jsonSchema: {
+    bsonType: 'object',
+    required: ['runId', 'reviewId', 'executionId', 'owner', 'repo', 'baseBranch', 'branch', 'status', 'createdAt'],
+    additionalProperties: true,
+    properties: {
+      runId: { bsonType: 'objectId' },
+      reviewId: { bsonType: 'objectId' },
+      executionId: { bsonType: 'objectId' },
+      owner: { bsonType: 'string', minLength: 1 },
+      repo: { bsonType: 'string', minLength: 1 },
+      baseBranch: { bsonType: 'string', minLength: 1 },
+      branch: { bsonType: 'string', minLength: 1 },
+      baseSha: { bsonType: ['string', 'null'] },
+      commitSha: { bsonType: ['string', 'null'] },
+      status: { enum: [...GITHUB_PUBLICATION_STATUSES] },
+      pullRequestNumber: { bsonType: ['int', 'null'] },
+      pullRequestUrl: { bsonType: ['string', 'null'] },
+      failureCategory: { bsonType: ['string', 'null'] },
+      failureMessage: { bsonType: ['string', 'null'] },
+      createdAt: { bsonType: 'date' },
+      completedAt: { bsonType: ['date', 'null'] },
+    },
+  },
+};
+
+/**
+ * Validator for one publication's deployment lifecycle. `provider` and
+ * `target` are non-secret, human-readable identifiers only (e.g.
+ * `'mock'`, `'mock-environment'`) — never a credential or endpoint that
+ * would need protecting; see deployment/deployment-provider.ts's module
+ * comment for why the provider interface itself is designed to never
+ * receive one. `validation` mirrors `changeExecutions.validation`'s shape
+ * (pass/fail plus a short summary per check, never full output).
+ */
+export const DEPLOYMENT_VALIDATOR: Document = {
+  $jsonSchema: {
+    bsonType: 'object',
+    required: ['runId', 'executionId', 'publicationId', 'owner', 'repo', 'pullRequestNumber', 'status', 'createdAt'],
+    additionalProperties: true,
+    properties: {
+      runId: { bsonType: 'objectId' },
+      executionId: { bsonType: 'objectId' },
+      publicationId: { bsonType: 'objectId' },
+      owner: { bsonType: 'string', minLength: 1 },
+      repo: { bsonType: 'string', minLength: 1 },
+      pullRequestNumber: { bsonType: 'int' },
+      mergeCommitSha: { bsonType: ['string', 'null'] },
+      status: { enum: [...DEPLOYMENT_STATUSES] },
+      provider: { bsonType: ['string', 'null'] },
+      target: { bsonType: ['string', 'null'] },
+      deploymentIdentifier: { bsonType: ['string', 'null'] },
+      validation: { bsonType: ['object', 'null'] },
+      failureCategory: { bsonType: ['string', 'null'] },
+      failureMessage: { bsonType: ['string', 'null'] },
+      createdAt: { bsonType: 'date' },
+      startedAt: { bsonType: ['date', 'null'] },
+      completedAt: { bsonType: ['date', 'null'] },
+    },
+  },
+};
+
 /** Collections created with options, rather than implicitly on first write. */
 export const COLLECTION_OPTIONS: Partial<Record<CollectionName, Document>> = {
   [COLLECTIONS.webhookDeliveries]: {
@@ -763,6 +1039,26 @@ export const COLLECTION_OPTIONS: Partial<Record<CollectionName, Document>> = {
   },
   [COLLECTIONS.repositorySelections]: {
     validator: REPOSITORY_SELECTION_VALIDATOR,
+    validationLevel: 'strict',
+    validationAction: 'error',
+  },
+  [COLLECTIONS.changeReviews]: {
+    validator: CHANGE_REVIEW_VALIDATOR,
+    validationLevel: 'strict',
+    validationAction: 'error',
+  },
+  [COLLECTIONS.changeExecutions]: {
+    validator: CHANGE_EXECUTION_VALIDATOR,
+    validationLevel: 'strict',
+    validationAction: 'error',
+  },
+  [COLLECTIONS.githubPublications]: {
+    validator: GITHUB_PUBLICATION_VALIDATOR,
+    validationLevel: 'strict',
+    validationAction: 'error',
+  },
+  [COLLECTIONS.deployments]: {
+    validator: DEPLOYMENT_VALIDATOR,
     validationLevel: 'strict',
     validationAction: 'error',
   },
